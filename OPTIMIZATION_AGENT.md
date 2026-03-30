@@ -11,12 +11,14 @@ Every states/sec improvement directly reduces wall-clock time on a cloud machine
 ## Ground Rules
 
 ### CORRECTNESS IS NON-NEGOTIABLE
-- Run `make test` after every change. All 21 tests must pass.
-- Run `make bench` after every change. Must print `Correctness: PASS`.
-- The benchmark checks **exact ground truth state counts**. If your optimization changes the number of states found or the number of terminal states, IT IS WRONG. Revert immediately.
+- ALL THREE must pass after every change:
+  1. `make test` — 21 unit tests (seed conservation, relay, captures, stress test)
+  2. `make bench` — single-threaded with EXACT ground truth state counts
+  3. `make bench_par` — parallel with production code path
+- The single-threaded benchmark checks **exact ground truth state counts**. If your optimization changes the number of states found or terminal states, IT IS WRONG. Revert immediately.
 - The ground truth values encode the complete game rules. Any change to move generation, sowing, captures, relay, canonicalization, or terminal detection will change these numbers.
-- Do NOT modify the benchmark itself or the ground truth values.
-- Do NOT modify the test suite to make failing tests pass.
+- Do NOT modify tests/test_engine.cpp, tests/benchmark.cpp, or tests/benchmark_parallel.cpp.
+- Do NOT modify the ground truth values in benchmark.cpp.
 
 ### Workflow for each optimization
 ```
@@ -26,18 +28,33 @@ Every states/sec improvement directly reduces wall-clock time on a cloud machine
 4. Run: make test
    - If FAIL → revert, try different approach
 5. Run: make bench
+   - Must print "Correctness: PASS" (catches any game rule change)
    - If FAIL → revert, try different approach
-6. Run: ./build/benchmark --states 5000000
-   - Record: states/sec and bytes/state
+6. Run: make bench_par
+   - Must print "Correctness: PASS" (catches parallel code issues)
+   - Record: Production score, Throughput, Stack entry size, Hash entry size
    - Compare to baseline
-7. If improvement → commit with clear message
-   If regression → revert
+7. If Production score improved → keep
+   If Production score decreased → revert
 ```
+
+### What to optimize
+The PRIMARY metric is the **Production score** from `make bench_par`:
+```
+Production score = Throughput × RAM fitness
+```
+Where RAM fitness = min(1.0, 512 GB / projected memory at 50B states).
+
+This rewards BOTH faster code AND smaller memory footprint. Reducing
+stack entry from 32 to 24 bytes improves RAM fitness. Making the hash
+table probe faster improves throughput. Both increase the score.
 
 ### Baseline metrics (on this machine)
 ```
-Throughput: ~2,800,000 states/sec (single-threaded benchmark)
-Memory:     33.6 bytes/state
+Production score:   11.3M (from bench_par)
+Throughput:         11.3M states/sec (parallel, 16 threads)
+Stack entry:        32 bytes (CompactState)
+Hash entry:         4 bytes (32-bit quotient tag)
 ```
 
 These are the numbers to beat. Any improvement counts.
@@ -174,13 +191,27 @@ Left-right board reflection is a symmetry. We use `canonical_hash_only()` which 
 
 18. **Link-time optimization (LTO)**: Compile with `-flto` to enable cross-file inlining (e.g., inline sow() into make_move() even though they're in different translation units).
 
+## Files You CAN Modify
+
+- `src/bao.h` — game engine (inline hot functions, state representation)
+- `src/bao.cpp` — game engine (non-hot functions)
+- `src/enumerate_core.h` — shared parallel infrastructure (hash table, CompactState, worker, work stealing)
+- `Makefile` — compiler flags only
+
+## Files You CANNOT Modify
+
+- `tests/test_engine.cpp` — unit tests (ground truth for correctness)
+- `tests/benchmark.cpp` — single-threaded benchmark (exact ground truth counts)
+- `tests/benchmark_parallel.cpp` — parallel benchmark (production score)
+- `docs/rules.md` — game rules specification
+
 ## What NOT to Do
 
 - Do NOT change game rules (sowing mechanics, capture rules, terminal conditions)
 - Do NOT change the canonical hash algorithm (would change state counts)
 - Do NOT change the Zobrist seed (would change ground truth)
 - Do NOT remove correctness checks from the engine (inner_empty, seed conservation)
-- Do NOT modify test_engine.cpp or benchmark.cpp ground truth values
+- Do NOT modify ANY file in tests/ or docs/
 - Do NOT use unsafe compiler flags (-ffast-math, -funsafe-loop-optimizations)
 - Do NOT introduce undefined behavior (unaligned writes, integer overflow, etc.)
 - Do NOT add external dependencies (the code must compile with just g++ and make)
@@ -188,9 +219,10 @@ Left-right board reflection is a symmetry. We use `canonical_hash_only()` which 
 ## Build Commands
 
 ```bash
-make test               # Run 21 correctness tests (must all pass)
-make bench              # Run benchmark with 2M states (must print PASS)
-./build/benchmark --states 5000000   # Longer benchmark run
+make test               # 21 correctness tests (ALL must pass)
+make bench              # Single-threaded, exact ground truth (must print PASS)
+make bench_par          # Parallel, production code path (must print PASS)
+                        # This is the PRIMARY metric — maximize Production score
 make enumerate_par      # Build the production parallel enumerator
 ```
 
@@ -198,12 +230,13 @@ make enumerate_par      # Build the production parallel enumerator
 
 ```
 BEFORE your change:
-  make bench → record states/sec and bytes/state
+  make bench_par → record Production score, Throughput, Stack entry, Hash entry
 
 AFTER your change:
   make test → must be 21/21 PASS
   make bench → must print "Correctness: PASS"
-  make bench → record new states/sec and bytes/state
+  make bench_par → must print "Correctness: PASS"
+  make bench_par → record new Production score
 
   Improvement = (new_throughput - old_throughput) / old_throughput * 100%
 ```
