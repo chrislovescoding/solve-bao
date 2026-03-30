@@ -146,17 +146,8 @@ private:
 // Canonicalize
 // ---------------------------------------------------------------------------
 
-static void canonicalize_state(BaoState& s) {
-    bool do_reflect = false;
-    for (int pos = 0; pos < TOTAL_PITS; ++pos) {
-        int si = pos >> 4, i = pos & 15;
-        uint8_t orig = s.pits[pos];
-        uint8_t refl = s.pits[(si << 4) + REFLECT[i]];
-        if (refl < orig) { do_reflect = true; break; }
-        if (refl > orig) break;
-    }
-    if (do_reflect) s.reflect_lr();
-    s.rehash();
+static inline void canonicalize_state(BaoState& s) {
+    s.canonicalize_and_hash();
 }
 
 // ---------------------------------------------------------------------------
@@ -278,54 +269,53 @@ static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
         Move moves[MAX_MOVES];
         int n = state.generate_moves(moves);
 
-        // --- Batched successor generation + prefetch ---
-        // Phase 1: Generate successors, canonicalize, collect hashes
-        struct Successor {
-            BaoState state;
-            uint64_t hash;
-        };
-        Successor succs[MAX_MOVES];
+        // --- Batched: generate successors, prefetch, then probe ---
+        // Phase 1: Generate all valid successors into a compact buffer
+        BaoState succs[MAX_MOVES];
+        uint64_t hashes[MAX_MOVES];
         int valid = 0;
 
         for (int i = 0; i < n; ++i) {
             stats.moves++;
 
-            BaoState succ = state;
-            MoveResult r = succ.make_move(moves[i]);
+            succs[valid] = state; // copy parent
+            MoveResult r = succs[valid].make_move(moves[i]);
 
-            if (r == MoveResult::INFINITE)        { stats.infinite++; continue; }
-            if (r == MoveResult::INNER_ROW_EMPTY) { stats.inner_row_end++; continue; }
+            if (__builtin_expect(r != MoveResult::OK, 0)) {
+                if (r == MoveResult::INFINITE) stats.infinite++;
+                else stats.inner_row_end++;
+                continue;
+            }
 
-            canonicalize_state(succ);
-            succs[valid].state = succ;
-            succs[valid].hash = succ.hash;
+            canonicalize_state(succs[valid]);
+            hashes[valid] = succs[valid].hash;
             valid++;
         }
 
-        // Phase 2: Prefetch all hash slots
+        // Phase 2: Prefetch all hash table slots (hides DRAM latency)
         for (int i = 0; i < valid; ++i)
-            visited.prefetch(succs[i].hash);
+            visited.prefetch(hashes[i]);
 
-        // Phase 3: Probe (now cache-warm) and push new states
+        // Phase 3: Probe cache-warm slots, push new states
         for (int i = 0; i < valid; ++i) {
-            if (!visited.insert(succs[i].hash))
+            if (!visited.insert(hashes[i]))
                 continue;
 
             stats.states++;
             size_t total = g_states.fetch_add(1, std::memory_order_relaxed) + 1;
 
-            if ((total & 0xFFFFF) == 0) {
+            if (__builtin_expect((total & 0xFFFFF) == 0, 0)) {
                 if (visited.load() > 0.75) {
                     g_table_full.store(true, std::memory_order_relaxed);
                     return;
                 }
             }
 
-            if (succs[i].state.is_terminal()) {
+            if (succs[i].is_terminal()) {
                 stats.terminal++;
                 g_terminal.fetch_add(1, std::memory_order_relaxed);
             } else {
-                my_work.stack.push_back(succs[i].state);
+                my_work.stack.push_back(succs[i]);
             }
         }
     }

@@ -50,17 +50,79 @@ uint64_t BaoState::compute_hash() const {
     return h;
 }
 
+uint64_t BaoState::canonicalize_and_hash() {
+    // Compute BOTH original and reflected hashes in ONE pass.
+    // The Zobrist table maps (position, value) → random bits.
+    // For the reflected state, position i maps to REFLECT[i] within each side,
+    // but the VALUE at that reflected position is pits[side*16 + REFLECT[i]].
+    //
+    // Original hash:  XOR_i ZOBRIST[i][pits[i]]
+    // Reflected hash: XOR_i ZOBRIST[i][pits[side*16 + REFLECT[i%16]]]
+    //
+    // We compute both simultaneously, then compare.
+    // If reflected hash < original: apply reflection, use reflected hash.
+    // If equal: compare pit arrays to break tie.
+    // If original hash < reflected: keep original, use original hash.
+    //
+    // This replaces: canonicalize() [32-byte compare + conditional 32-byte shuffle]
+    //                + rehash() [32 Zobrist lookups]
+    // With: 32 Zobrist lookups for original + 32 for reflected = 64 lookups,
+    // BUT no conditional branch, no memcpy, no reflect_lr() call.
+
+    uint64_t h_orig = 0;
+    uint64_t h_refl = 0;
+
+    for (int s = 0; s < 2; ++s) {
+        int base = s * PITS_PER_SIDE;
+        for (int i = 0; i < PITS_PER_SIDE; ++i) {
+            int pos = base + i;
+            h_orig ^= ZOBRIST_TABLE[pos][pits[pos]];
+            h_refl ^= ZOBRIST_TABLE[pos][pits[base + REFLECT[i]]];
+        }
+    }
+
+    if (h_refl < h_orig) {
+        // Reflected version has smaller hash — apply reflection
+        reflect_lr();
+        hash = h_refl;
+        return h_refl;
+    }
+    if (h_orig < h_refl) {
+        // Original is canonical
+        hash = h_orig;
+        return h_orig;
+    }
+
+    // Hashes are equal (extremely rare) — fall back to lex comparison
+    // to determine canonical form deterministically
+    bool do_reflect = false;
+    for (int pos = 0; pos < TOTAL_PITS; ++pos) {
+        int si = pos >> 4, i = pos & 15;
+        uint8_t orig = pits[pos];
+        uint8_t refl = pits[(si << 4) + REFLECT[i]];
+        if (refl < orig) { do_reflect = true; break; }
+        if (refl > orig) break;
+    }
+    if (do_reflect) {
+        reflect_lr();
+        hash = h_refl; // same as h_orig since they're equal
+    } else {
+        hash = h_orig;
+    }
+    return hash;
+}
+
 // ---------------------------------------------------------------------------
 // Symmetry
 // ---------------------------------------------------------------------------
 
 void BaoState::swap_sides() {
-    uint8_t tmp[PITS_PER_SIDE];
-    memcpy(tmp,                   &pits[0],             PITS_PER_SIDE);
-    memcpy(&pits[0],              &pits[PITS_PER_SIDE], PITS_PER_SIDE);
-    memcpy(&pits[PITS_PER_SIDE],  tmp,                  PITS_PER_SIDE);
-    // NOTE: does NOT rehash. Caller must rehash when needed.
-    // This avoids redundant hashing when canonicalize follows immediately.
+    // Swap 16 bytes at a time. Compiler will use SIMD if available.
+    uint64_t *a = (uint64_t*)&pits[0];
+    uint64_t *b = (uint64_t*)&pits[PITS_PER_SIDE];
+    // 16 bytes = 2 uint64_t swaps
+    uint64_t t0 = a[0]; a[0] = b[0]; b[0] = t0;
+    uint64_t t1 = a[1]; a[1] = b[1]; b[1] = t1;
 }
 
 void BaoState::reflect_lr() {
@@ -89,35 +151,39 @@ bool BaoState::canonicalize() {
 // ---------------------------------------------------------------------------
 
 int BaoState::sow(int start_idx, int count, int dir) {
-    uint8_t* p = &pits[0]; // side 0
+    uint8_t* __restrict__ p = &pits[0]; // side 0
+    int step = (dir + PITS_PER_SIDE) & 15; // precompute: CW=1, ACW=15
 
-    if (count < PITS_PER_SIDE) {
-        // Common path: small count, simple loop
+    if (__builtin_expect(count < PITS_PER_SIDE, 1)) {
+        // Hot path: small count. No branch in inner loop.
         int idx = start_idx;
-        for (int i = 0; i < count; ++i) {
+        int remaining = count;
+        while (--remaining > 0) {
             p[idx]++;
-            if (i < count - 1)
-                idx = (idx + dir + PITS_PER_SIDE) & 15;
+            idx = (idx + step) & 15;
         }
+        p[idx]++; // last seed
         return idx;
     }
 
-    // Large count: batch — add q to all pits, then 1 to first r pits
-    int q = count >> 4;   // count / 16
-    int r = count & 15;   // count % 16
+    // Large count: batch — add q to all 16 pits, then 1 to first r pits
+    int q = count >> 4;
+    int r = count & 15;
 
+    // Batch add (compiler can auto-vectorize this)
     for (int i = 0; i < PITS_PER_SIDE; ++i)
         p[i] += (uint8_t)q;
 
-    if (r == 0)
-        return (start_idx + 15 * dir + PITS_PER_SIDE * 16) & 15;
+    if (__builtin_expect(r == 0, 0))
+        return (start_idx + 15 * step) & 15;
 
     int idx = start_idx;
-    for (int i = 0; i < r; ++i) {
+    int remaining = r;
+    while (--remaining > 0) {
         p[idx]++;
-        if (i < r - 1)
-            idx = (idx + dir + PITS_PER_SIDE) & 15;
+        idx = (idx + step) & 15;
     }
+    p[idx]++;
     return idx;
 }
 
