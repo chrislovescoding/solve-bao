@@ -34,10 +34,10 @@
 
 class AtomicHashSet {
 public:
+    // No power-of-2 constraint! Uses Fastrange for slot mapping.
+    // This lets us use EVERY byte of available RAM.
     explicit AtomicHashSet(size_t capacity, bool use_hugepages = true) {
-        capacity_ = 1;
-        while (capacity_ < capacity) capacity_ <<= 1;
-        mask_ = capacity_ - 1;
+        capacity_ = capacity;
         count_.store(0, std::memory_order_relaxed);
 
         size_t bytes = capacity_ * sizeof(uint64_t);
@@ -83,10 +83,21 @@ public:
         free(table_);
     }
 
+    // Fastrange: maps hash to [0, capacity) without modulo.
+    // One 128-bit multiply + shift. Works for ANY capacity.
+    inline size_t slot_for(uint64_t h) const {
+        return (size_t)(((__uint128_t)h * capacity_) >> 64);
+    }
+
+    inline size_t next_slot(size_t slot) const {
+        size_t s = slot + 1;
+        return s < capacity_ ? s : 0;
+    }
+
     // Insert: returns true if newly inserted. Lock-free via CAS.
     bool insert(uint64_t h) {
         if (h == 0) h = 1;
-        size_t slot = h & mask_;
+        size_t slot = slot_for(h);
         while (true) {
             uint64_t expected = 0;
             if (table_[slot].compare_exchange_strong(
@@ -98,15 +109,14 @@ public:
             }
             if (expected == h)
                 return false;
-            slot = (slot + 1) & mask_;
+            slot = next_slot(slot);
         }
     }
 
     // Prefetch the cache line for a future probe
     void prefetch(uint64_t h) const {
         if (h == 0) h = 1;
-        size_t slot = h & mask_;
-        __builtin_prefetch(&table_[slot], 1, 0); // write, no temporal locality
+        __builtin_prefetch(&table_[slot_for(h)], 1, 0);
     }
 
     size_t count()    const { return count_.load(std::memory_order_relaxed); }
@@ -115,7 +125,7 @@ public:
 
 private:
     std::atomic<uint64_t>* table_;
-    size_t capacity_, mask_;
+    size_t capacity_;
     std::atomic<size_t> count_;
     size_t alloc_bytes_ = 0;
     bool use_mmap_ = false;
