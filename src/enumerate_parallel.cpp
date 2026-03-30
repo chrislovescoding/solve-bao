@@ -50,8 +50,10 @@ int main(int argc, char* argv[]) {
     std::vector<ThreadStats> thread_stats(num_threads);
     std::vector<std::thread> threads;
 
-    // Reporter
+    // Reporter + drain detector
     std::thread report_thread([&]() {
+        size_t prev_states = 0;
+        int stall_count = 0;
         while (!g.done.load(std::memory_order_relaxed) &&
                !g.table_full.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -59,11 +61,30 @@ int main(int argc, char* argv[]) {
             size_t t = g.terminal.load(std::memory_order_relaxed);
             double elapsed = difftime(time(nullptr), t0);
             double rate = elapsed > 0 ? s / elapsed : 0;
+            size_t new_states = s - prev_states;
+            bool is_draining = g.draining.load(std::memory_order_relaxed);
+
             fprintf(stderr,
                 "\r  States: %12zu | Terminal: %10zu | Load: %.4f | "
-                "%.1fM st/s | %.0fs     ",
-                s, t, (double)s / visited.capacity(), rate / 1e6, elapsed);
+                "%.1fM st/s | +%zu/2s%s | %.0fs     ",
+                s, t, (double)s / visited.capacity(), rate / 1e6,
+                new_states, is_draining ? " [DRAINING]" : "", elapsed);
             fflush(stderr);
+
+            // Detect stall: if fewer than 1000 new states in 2 seconds,
+            // for 3 consecutive checks (6 seconds total), enable drain mode.
+            // This stops work stealing so threads can drain their stacks.
+            if (new_states < 1000 && s > 1000000) {
+                stall_count++;
+                if (stall_count >= 3 && !is_draining) {
+                    g.draining.store(true, std::memory_order_relaxed);
+                    fprintf(stderr, "\n  >>> Discovery stalled. Enabling drain mode. <<<\n");
+                }
+            } else {
+                stall_count = 0;
+            }
+
+            prev_states = s;
         }
     });
 

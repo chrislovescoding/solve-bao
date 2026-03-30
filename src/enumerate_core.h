@@ -179,9 +179,11 @@ struct EnumGlobals {
     std::atomic<size_t> terminal{0};
     std::atomic<bool>   table_full{false};
     std::atomic<bool>   done{false};
+    std::atomic<size_t> last_discovery_states{0};  // snapshot for drain detection
+    std::atomic<bool>   draining{false};           // true = no new states, just drain stacks
     int num_threads = 0;
     ThreadWork* work = nullptr;
-    size_t max_states = 0; // 0 = unlimited (production), >0 = benchmark limit
+    size_t max_states = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +256,12 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
         BaoState state;
         {
             if (__builtin_expect(my_work.stack.empty(), 0)) {
+                // If draining (no new states being found), don't steal —
+                // just let this thread finish. Prevents endless redistribution
+                // of stale stack entries between threads.
+                if (g.draining.load(std::memory_order_relaxed))
+                    return;
+
                 StealResult r = try_steal(my_work, stats, tid, g, rng);
                 if (r == StealResult::ALL_IDLE) return;
                 if (r == StealResult::RETRY) continue;
