@@ -1,10 +1,17 @@
 /*
- * enumerate_parallel.cpp — Parallel state space enumerator
+ * enumerate_parallel.cpp — Parallel state space enumerator (v2 — optimized)
  *
- * Lock-free atomic hash table + per-thread DFS stacks.
- * Single-threaded warmup, then splits work across N threads.
+ * Optimizations over v1:
+ *   1. Huge pages (2MB) for hash table — eliminates TLB misses
+ *   2. Software prefetching — hides DRAM latency on hash probes
+ *   3. Work stealing — keeps all cores busy until the end
+ *   4. Batched successor processing — prefetch all slots, then probe
  *
  * Usage: enumerate_parallel [--mem-gb N] [--threads T]
+ *
+ * Before running, enable huge pages:
+ *   echo 65536 > /proc/sys/vm/nr_hugepages
+ * (or however many 2MB pages you need: mem_gb * 512 + some margin)
  */
 
 #include "bao.h"
@@ -14,39 +21,74 @@
 #include <ctime>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 // ---------------------------------------------------------------------------
-// Lock-free hash set (atomic CAS, linear probing)
+// Lock-free hash set with huge pages + prefetch support
 // ---------------------------------------------------------------------------
 
 class AtomicHashSet {
 public:
-    explicit AtomicHashSet(size_t capacity) {
+    explicit AtomicHashSet(size_t capacity, bool use_hugepages = true) {
         capacity_ = 1;
         while (capacity_ < capacity) capacity_ <<= 1;
         mask_ = capacity_ - 1;
         count_.store(0, std::memory_order_relaxed);
 
-        // calloc gives us zero-initialized memory (0 = empty sentinel)
-        table_ = (std::atomic<uint64_t>*)calloc(capacity_, sizeof(uint64_t));
+        size_t bytes = capacity_ * sizeof(uint64_t);
+        table_ = nullptr;
+
+#ifdef __linux__
+        if (use_hugepages) {
+            void* ptr = mmap(nullptr, bytes,
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                             -1, 0);
+            if (ptr != MAP_FAILED) {
+                table_ = (std::atomic<uint64_t>*)ptr;
+                alloc_bytes_ = bytes;
+                use_mmap_ = true;
+                fprintf(stderr, "  Hash table: huge pages (%zu GB)\n",
+                        bytes / (1024ULL*1024*1024));
+            } else {
+                fprintf(stderr, "  Huge pages unavailable, falling back to calloc\n");
+            }
+        }
+#else
+        (void)use_hugepages;
+#endif
+
+        if (!table_) {
+            table_ = (std::atomic<uint64_t>*)calloc(capacity_, sizeof(uint64_t));
+            alloc_bytes_ = bytes;
+            use_mmap_ = false;
+        }
+
         if (!table_) {
             fprintf(stderr, "FATAL: alloc failed (%zu GB)\n",
-                    capacity_ * 8 / (1024ULL*1024*1024));
+                    bytes / (1024ULL*1024*1024));
             exit(1);
         }
     }
 
-    ~AtomicHashSet() { free(table_); }
+    ~AtomicHashSet() {
+#ifdef __linux__
+        if (use_mmap_) { munmap(table_, alloc_bytes_); return; }
+#endif
+        free(table_);
+    }
 
-    // Returns true if newly inserted, false if already present.
-    // Thread-safe, lock-free.
+    // Insert: returns true if newly inserted. Lock-free via CAS.
     bool insert(uint64_t h) {
         if (h == 0) h = 1;
         size_t slot = h & mask_;
         while (true) {
             uint64_t expected = 0;
-            // Try to claim empty slot
             if (table_[slot].compare_exchange_strong(
                     expected, h,
                     std::memory_order_relaxed,
@@ -54,12 +96,17 @@ public:
                 count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            // Slot was occupied — check if it's our value
             if (expected == h)
                 return false;
-            // Collision — probe next slot
             slot = (slot + 1) & mask_;
         }
+    }
+
+    // Prefetch the cache line for a future probe
+    void prefetch(uint64_t h) const {
+        if (h == 0) h = 1;
+        size_t slot = h & mask_;
+        __builtin_prefetch(&table_[slot], 1, 0); // write, no temporal locality
     }
 
     size_t count()    const { return count_.load(std::memory_order_relaxed); }
@@ -70,6 +117,8 @@ private:
     std::atomic<uint64_t>* table_;
     size_t capacity_, mask_;
     std::atomic<size_t> count_;
+    size_t alloc_bytes_ = 0;
+    bool use_mmap_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -90,46 +139,113 @@ static void canonicalize_state(BaoState& s) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread stats
+// Per-thread stats (cache-line padded to avoid false sharing)
 // ---------------------------------------------------------------------------
 
-struct ThreadStats {
-    size_t states;
-    size_t terminal;
-    size_t moves;
-    size_t infinite;
-    size_t inner_row_end;
-    size_t stack_peak;
+struct alignas(64) ThreadStats {
+    size_t states       = 0;
+    size_t terminal     = 0;
+    size_t moves        = 0;
+    size_t infinite     = 0;
+    size_t inner_row_end = 0;
+    size_t stack_peak   = 0;
+    size_t steals       = 0;
+    char _pad[8];
 };
 
 // ---------------------------------------------------------------------------
-// Global atomic stats for progress reporting
+// Global state
 // ---------------------------------------------------------------------------
 
 static std::atomic<size_t> g_states{0};
 static std::atomic<size_t> g_terminal{0};
 static std::atomic<bool>   g_table_full{false};
+static std::atomic<bool>   g_done{false};
 static time_t              g_start_time;
 
+// Per-thread stacks + mutexes for work stealing
+struct alignas(64) ThreadWork {
+    std::vector<BaoState> stack;
+    std::mutex mtx;           // only locked during steal operations
+    std::atomic<bool> active{true};
+};
+
+static int g_num_threads;
+static ThreadWork* g_work; // array of per-thread work
+
 // ---------------------------------------------------------------------------
-// Worker thread: DFS on local stack, shared hash table
+// Worker thread with prefetching + work stealing
 // ---------------------------------------------------------------------------
 
-static void worker(AtomicHashSet& visited,
-                   std::vector<BaoState> initial_stack,
-                   ThreadStats& stats,
-                   int thread_id) {
-    (void)thread_id;
+static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
     stats = {};
+    ThreadWork& my_work = g_work[tid];
 
-    std::vector<BaoState> stack = std::move(initial_stack);
+    // Simple LCG for random victim selection during stealing
+    uint32_t rng = (uint32_t)(tid * 2654435761u + 1);
+    auto next_rng = [&]() -> int {
+        rng = rng * 1103515245u + 12345u;
+        return (int)((rng >> 16) % g_num_threads);
+    };
 
-    while (!stack.empty() && !g_table_full.load(std::memory_order_relaxed)) {
-        BaoState state = stack.back();
-        stack.pop_back();
+    while (!g_table_full.load(std::memory_order_relaxed)) {
+        // Get work from local stack
+        BaoState state;
+        {
+            // Fast path: no lock needed if we're just popping our own stack
+            if (my_work.stack.empty()) {
+                // Try to steal from another thread
+                bool stolen = false;
+                for (int attempts = 0; attempts < g_num_threads * 2; ++attempts) {
+                    int victim = next_rng();
+                    if (victim == tid) continue;
+                    if (!g_work[victim].active.load(std::memory_order_relaxed)) continue;
 
-        if (stack.size() > stats.stack_peak)
-            stats.stack_peak = stack.size();
+                    std::unique_lock<std::mutex> lock(g_work[victim].mtx, std::try_to_lock);
+                    if (!lock.owns_lock()) continue;
+
+                    size_t victim_size = g_work[victim].stack.size();
+                    if (victim_size < 2) continue;
+
+                    // Steal half
+                    size_t steal_count = victim_size / 2;
+                    auto begin = g_work[victim].stack.end() - steal_count;
+                    auto end = g_work[victim].stack.end();
+
+                    my_work.stack.insert(my_work.stack.end(), begin, end);
+                    g_work[victim].stack.erase(begin, end);
+
+                    stats.steals++;
+                    stolen = true;
+                    break;
+                }
+
+                if (!stolen) {
+                    // Check if all threads are idle
+                    my_work.active.store(false, std::memory_order_relaxed);
+                    bool all_idle = true;
+                    for (int t = 0; t < g_num_threads; ++t) {
+                        if (g_work[t].active.load(std::memory_order_relaxed) ||
+                            !g_work[t].stack.empty()) {
+                            all_idle = false;
+                            break;
+                        }
+                    }
+                    if (all_idle) return;
+
+                    // Brief backoff then retry
+                    std::this_thread::yield();
+                    my_work.active.store(true, std::memory_order_relaxed);
+                    continue;
+                }
+            }
+
+            state = my_work.stack.back();
+            my_work.stack.pop_back();
+        }
+
+        if (my_work.stack.size() > stats.stack_peak)
+            stats.stack_peak = my_work.stack.size();
 
         if (state.is_terminal()) {
             stats.terminal++;
@@ -137,8 +253,18 @@ static void worker(AtomicHashSet& visited,
             continue;
         }
 
+        // Generate all moves
         Move moves[MAX_MOVES];
         int n = state.generate_moves(moves);
+
+        // --- Batched successor generation + prefetch ---
+        // Phase 1: Generate successors, canonicalize, collect hashes
+        struct Successor {
+            BaoState state;
+            uint64_t hash;
+        };
+        Successor succs[MAX_MOVES];
+        int valid = 0;
 
         for (int i = 0; i < n; ++i) {
             stats.moves++;
@@ -150,44 +276,37 @@ static void worker(AtomicHashSet& visited,
             if (r == MoveResult::INNER_ROW_EMPTY) { stats.inner_row_end++; continue; }
 
             canonicalize_state(succ);
+            succs[valid].state = succ;
+            succs[valid].hash = succ.hash;
+            valid++;
+        }
 
-            if (!visited.insert(succ.hash))
+        // Phase 2: Prefetch all hash slots
+        for (int i = 0; i < valid; ++i)
+            visited.prefetch(succs[i].hash);
+
+        // Phase 3: Probe (now cache-warm) and push new states
+        for (int i = 0; i < valid; ++i) {
+            if (!visited.insert(succs[i].hash))
                 continue;
 
             stats.states++;
             size_t total = g_states.fetch_add(1, std::memory_order_relaxed) + 1;
 
-            // Check load factor periodically
-            if ((total & 0xFFFFF) == 0) { // every ~1M states
+            if ((total & 0xFFFFF) == 0) {
                 if (visited.load() > 0.75) {
                     g_table_full.store(true, std::memory_order_relaxed);
-                    fprintf(stderr, "\nTABLE FULL at %zu states\n", visited.count());
                     return;
                 }
             }
 
-            stack.push_back(succ);
+            if (succs[i].state.is_terminal()) {
+                stats.terminal++;
+                g_terminal.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                my_work.stack.push_back(succs[i].state);
+            }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Progress reporter thread
-// ---------------------------------------------------------------------------
-
-static void reporter(AtomicHashSet& visited) {
-    while (!g_table_full.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        size_t s = g_states.load(std::memory_order_relaxed);
-        size_t t = g_terminal.load(std::memory_order_relaxed);
-        double elapsed = difftime(time(nullptr), g_start_time);
-        double rate = elapsed > 0 ? s / elapsed : 0;
-        fprintf(stderr,
-            "\r  States: %12zu | Terminal: %10zu | Load: %.4f | "
-            "%.0f st/s | %.0fs     ",
-            s, t, visited.load(), rate, elapsed);
-        fflush(stderr);
-        if (s == 0) continue;
     }
 }
 
@@ -196,7 +315,7 @@ static void reporter(AtomicHashSet& visited) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-    size_t mem_gb = 200;
+    size_t mem_gb = 100;
     int num_threads = (int)std::thread::hardware_concurrency();
     if (num_threads < 1) num_threads = 8;
 
@@ -207,84 +326,80 @@ int main(int argc, char* argv[]) {
             num_threads = atoi(argv[++i]);
     }
 
+    g_num_threads = num_threads;
+
     size_t table_bytes = mem_gb * (size_t)1024 * 1024 * 1024;
     size_t table_cap   = table_bytes / sizeof(uint64_t);
     size_t max_states  = (size_t)(table_cap * 0.70);
 
-    printf("Bao la Kujifunza — Parallel State Enumerator\n");
-    printf("=============================================\n");
-    printf("Hash table:  %zu GB (%zu M entries, ~%zu M max)\n",
-           mem_gb, table_cap / 1000000, max_states / 1000000);
+    printf("Bao la Kujifunza — Parallel State Enumerator v2\n");
+    printf("================================================\n");
+    printf("Hash table:  %zu GB (~%zu M max states)\n", mem_gb, max_states / 1000000);
     printf("Threads:     %d\n", num_threads);
+    printf("Features:    huge pages, prefetch, work stealing\n");
     printf("\n");
 
     zobrist_init();
-    AtomicHashSet visited(table_cap);
 
-    // --- Phase 1: single-threaded warmup ---
-    // Build up the stack until we have enough work to split.
+    fprintf(stderr, "Allocating hash table...\n");
+    AtomicHashSet visited(table_cap, true);
+
+    // --- Warmup ---
     size_t warmup_target = (size_t)num_threads * 10000;
+    fprintf(stderr, "Warmup (target %zu stack entries)...\n", warmup_target);
 
-    fprintf(stderr, "Phase 1: warmup (building %zu stack entries)...\n", warmup_target);
-
-    std::vector<BaoState> stack;
-    stack.reserve(warmup_target * 2);
+    std::vector<BaoState> warmup_stack;
+    warmup_stack.reserve(warmup_target * 2);
 
     BaoState start;
     start.init_start();
     canonicalize_state(start);
     visited.insert(start.hash);
     g_states.store(1, std::memory_order_relaxed);
-    stack.push_back(start);
+    warmup_stack.push_back(start);
 
     size_t warmup_states = 1;
+    while (warmup_stack.size() < warmup_target && !warmup_stack.empty()) {
+        BaoState st = warmup_stack.back();
+        warmup_stack.pop_back();
 
-    while (stack.size() < warmup_target && !stack.empty()) {
-        BaoState state = stack.back();
-        stack.pop_back();
-
-        if (state.is_terminal()) {
+        if (st.is_terminal()) {
             g_terminal.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
         Move moves[MAX_MOVES];
-        int n = state.generate_moves(moves);
-
+        int n = st.generate_moves(moves);
         for (int i = 0; i < n; ++i) {
-            BaoState succ = state;
+            BaoState succ = st;
             MoveResult r = succ.make_move(moves[i]);
             if (r != MoveResult::OK) continue;
-
             canonicalize_state(succ);
             if (!visited.insert(succ.hash)) continue;
-
             warmup_states++;
             g_states.fetch_add(1, std::memory_order_relaxed);
-            stack.push_back(succ);
+            warmup_stack.push_back(succ);
         }
     }
 
-    fprintf(stderr, "Warmup done: %zu states, %zu stack entries\n",
-            warmup_states, stack.size());
+    fprintf(stderr, "Warmup: %zu states, %zu stack entries\n\n",
+            warmup_states, warmup_stack.size());
 
-    // --- Phase 2: split stack across threads ---
-    fprintf(stderr, "Phase 2: parallel DFS with %d threads...\n", num_threads);
+    // --- Split and launch ---
+    g_work = new ThreadWork[num_threads];
+    for (size_t i = 0; i < warmup_stack.size(); ++i)
+        g_work[i % num_threads].stack.push_back(warmup_stack[i]);
+    warmup_stack.clear();
+    warmup_stack.shrink_to_fit();
+
     g_start_time = time(nullptr);
-
-    std::vector<std::vector<BaoState>> thread_stacks(num_threads);
-    for (size_t i = 0; i < stack.size(); ++i)
-        thread_stacks[i % num_threads].push_back(stack[i]);
-    stack.clear();
-    stack.shrink_to_fit();
 
     std::vector<ThreadStats> thread_stats(num_threads);
     std::vector<std::thread> threads;
 
-    // Start reporter
-    std::atomic<bool> reporter_done{false};
+    // Reporter
     std::thread report_thread([&]() {
-        while (!reporter_done.load(std::memory_order_relaxed)) {
+        while (!g_done.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             size_t s = g_states.load(std::memory_order_relaxed);
             size_t t = g_terminal.load(std::memory_order_relaxed);
@@ -298,31 +413,26 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // Launch workers
-    for (int t = 0; t < num_threads; ++t) {
+    // Workers
+    for (int t = 0; t < num_threads; ++t)
         threads.emplace_back(worker, std::ref(visited),
-                             std::move(thread_stacks[t]),
                              std::ref(thread_stats[t]), t);
-    }
 
-    for (auto& th : threads)
-        th.join();
-
-    reporter_done.store(true, std::memory_order_relaxed);
+    for (auto& th : threads) th.join();
+    g_done.store(true, std::memory_order_relaxed);
     report_thread.join();
 
-    // --- Aggregate stats ---
-    size_t total_states    = g_states.load();
-    size_t total_terminal  = g_terminal.load();
-    size_t total_moves     = 0;
-    size_t total_infinite  = 0;
-    size_t total_inner     = 0;
-    size_t peak_stack      = 0;
+    // --- Results ---
+    size_t total_states   = g_states.load();
+    size_t total_terminal = g_terminal.load();
+    size_t total_moves = 0, total_infinite = 0, total_inner = 0;
+    size_t peak_stack = 0, total_steals = 0;
 
     for (int t = 0; t < num_threads; ++t) {
         total_moves    += thread_stats[t].moves;
         total_infinite += thread_stats[t].infinite;
         total_inner    += thread_stats[t].inner_row_end;
+        total_steals   += thread_stats[t].steals;
         if (thread_stats[t].stack_peak > peak_stack)
             peak_stack = thread_stats[t].stack_peak;
     }
@@ -339,6 +449,7 @@ int main(int argc, char* argv[]) {
     printf("Moves explored:    %zu\n", total_moves);
     printf("Infinite moves:    %zu\n", total_infinite);
     printf("Inner-row wins:    %zu\n", total_inner);
+    printf("Work steals:       %zu\n", total_steals);
     printf("Peak stack/thread: %zu (%zu MB)\n",
            peak_stack, peak_stack * sizeof(BaoState) / (1024*1024));
     printf("Hash load:         %.4f\n", visited.load());
@@ -346,5 +457,6 @@ int main(int argc, char* argv[]) {
     if (elapsed > 0)
         printf("Rate:              %.1fM states/sec\n", total_states / elapsed / 1e6);
 
+    delete[] g_work;
     return complete ? 0 : 1;
 }
