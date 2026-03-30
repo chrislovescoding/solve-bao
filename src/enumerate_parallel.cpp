@@ -62,7 +62,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr,
                 "\r  States: %12zu | Terminal: %10zu | Load: %.4f | "
                 "%.1fM st/s | %.0fs     ",
-                s, t, visited.load(), rate / 1e6, elapsed);
+                s, t, (double)s / visited.capacity(), rate / 1e6, elapsed);
             fflush(stderr);
         }
     });
@@ -107,7 +107,7 @@ int main(int argc, char* argv[]) {
     printf("Work steals:       %zu\n", total_steals);
     printf("Peak stack/thread: %zu (%zu MB)\n",
            peak_stack, peak_stack * sizeof(CompactState) / (1024*1024));
-    printf("Hash load:         %.4f\n", visited.load());
+    printf("Hash load:         %.4f\n", (double)total_states / visited.capacity());
     printf("Elapsed:           %.1f sec\n", elapsed);
     if (elapsed > 0)
         printf("Rate:              %.1fM states/sec\n", total_states / elapsed / 1e6);
