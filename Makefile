@@ -41,7 +41,7 @@ build/benchmark: $(BENCH_SRC) $(SRC) $(HDR) | build
 	$(CXX) $(CXXFLAGS_FAST) -o $@ $(BENCH_SRC) $(SRC)
 
 build/benchmark_parallel: $(BENCH_PAR_SRC) $(SRC) $(HDR) | build
-	$(CXX) $(CXXFLAGS_FAST) -fprofile-use=build/pgo -fprofile-correction -funroll-loops -o $@ $(BENCH_PAR_SRC) $(SRC) -lpthread
+	$(CXX) $(CXXFLAGS_FAST) -funroll-loops -o $@ $(BENCH_PAR_SRC) $(SRC) -lpthread
 
 # PGO training: use same output name so gcda files match
 pgo_train: | build
