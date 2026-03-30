@@ -34,13 +34,20 @@
 
 class AtomicHashSet {
 public:
-    // No power-of-2 constraint! Uses Fastrange for slot mapping.
-    // This lets us use EVERY byte of available RAM.
+    // 32-bit quotient tags: 4 bytes per entry (was 8).
+    //
+    // slot_for(h) uses upper bits of h to pick a slot (~34 bits of entropy).
+    // We store only the lower 31 bits as a "tag" (bit 0 forced to 1 to
+    // avoid the 0 empty sentinel). Combined: 34 + 31 = 65 effective bits.
+    //
+    // 180 GB = 45 billion slots. At 70% load = 31.5 billion states.
+    // False collision rate: ~14 per 18B states (negligible).
+
     explicit AtomicHashSet(size_t capacity, bool use_hugepages = true) {
         capacity_ = capacity;
         count_.store(0, std::memory_order_relaxed);
 
-        size_t bytes = capacity_ * sizeof(uint64_t);
+        size_t bytes = capacity_ * sizeof(uint32_t);
         table_ = nullptr;
 
 #ifdef __linux__
@@ -50,10 +57,10 @@ public:
                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
                              -1, 0);
             if (ptr != MAP_FAILED) {
-                table_ = (std::atomic<uint64_t>*)ptr;
+                table_ = (std::atomic<uint32_t>*)ptr;
                 alloc_bytes_ = bytes;
                 use_mmap_ = true;
-                fprintf(stderr, "  Hash table: huge pages (%zu GB)\n",
+                fprintf(stderr, "  Hash table: huge pages (%zu GB, 4 bytes/slot)\n",
                         bytes / (1024ULL*1024*1024));
             } else {
                 fprintf(stderr, "  Huge pages unavailable, falling back to calloc\n");
@@ -64,7 +71,7 @@ public:
 #endif
 
         if (!table_) {
-            table_ = (std::atomic<uint64_t>*)calloc(capacity_, sizeof(uint64_t));
+            table_ = (std::atomic<uint32_t>*)calloc(capacity_, sizeof(uint32_t));
             alloc_bytes_ = bytes;
             use_mmap_ = false;
         }
@@ -83,10 +90,15 @@ public:
         free(table_);
     }
 
-    // Fastrange: maps hash to [0, capacity) without modulo.
-    // One 128-bit multiply + shift. Works for ANY capacity.
+    // Fastrange: maps hash to [0, capacity). Uses UPPER bits of h.
     inline size_t slot_for(uint64_t h) const {
         return (size_t)(((__uint128_t)h * capacity_) >> 64);
+    }
+
+    // Tag: LOWER 31 bits of h, with bit 0 forced to 1 (0 = empty sentinel).
+    // Independent of slot_for which uses upper bits.
+    static inline uint32_t tag_for(uint64_t h) {
+        return (uint32_t)(h) | 1u;
     }
 
     inline size_t next_slot(size_t slot) const {
@@ -94,20 +106,20 @@ public:
         return s < capacity_ ? s : 0;
     }
 
-    // Insert: returns true if newly inserted. Lock-free via CAS.
+    // Insert: returns true if newly inserted. Lock-free via 32-bit CAS.
     bool insert(uint64_t h) {
-        if (h == 0) h = 1;
+        uint32_t tag = tag_for(h);
         size_t slot = slot_for(h);
         while (true) {
-            uint64_t expected = 0;
+            uint32_t expected = 0;
             if (table_[slot].compare_exchange_strong(
-                    expected, h,
+                    expected, tag,
                     std::memory_order_relaxed,
                     std::memory_order_relaxed)) {
                 count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
-            if (expected == h)
+            if (expected == tag)
                 return false;
             slot = next_slot(slot);
         }
@@ -115,7 +127,6 @@ public:
 
     // Prefetch the cache line for a future probe
     void prefetch(uint64_t h) const {
-        if (h == 0) h = 1;
         __builtin_prefetch(&table_[slot_for(h)], 1, 0);
     }
 
@@ -124,7 +135,7 @@ public:
     double load()     const { return (double)count() / capacity_; }
 
 private:
-    std::atomic<uint64_t>* table_;
+    std::atomic<uint32_t>* table_;
     size_t capacity_;
     std::atomic<size_t> count_;
     size_t alloc_bytes_ = 0;
@@ -339,14 +350,15 @@ int main(int argc, char* argv[]) {
     g_num_threads = num_threads;
 
     size_t table_bytes = mem_gb * (size_t)1024 * 1024 * 1024;
-    size_t table_cap   = table_bytes / sizeof(uint64_t);
+    size_t table_cap   = table_bytes / sizeof(uint32_t); // 4 bytes per slot now!
     size_t max_states  = (size_t)(table_cap * 0.70);
 
-    printf("Bao la Kujifunza — Parallel State Enumerator v2\n");
+    printf("Bao la Kujifunza — Parallel State Enumerator v3\n");
     printf("================================================\n");
-    printf("Hash table:  %zu GB (~%zu M max states)\n", mem_gb, max_states / 1000000);
+    printf("Hash table:  %zu GB, 4 bytes/slot, %zu B slots, ~%zu B max states\n",
+           mem_gb, table_cap / 1000000000, max_states / 1000000000);
     printf("Threads:     %d\n", num_threads);
-    printf("Features:    huge pages, prefetch, work stealing\n");
+    printf("Features:    32-bit quotient tags, huge pages, prefetch, work stealing\n");
     printf("\n");
 
     zobrist_init();
