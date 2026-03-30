@@ -128,7 +128,7 @@ struct BaoState {
     // the state stays in its original (possibly non-canonical) orientation.
     // Both orientations generate the same set of canonical successor hashes,
     // so this is safe for counting reachable states.
-    inline uint64_t canonical_hash_only() const {
+    __attribute__((hot)) inline uint64_t canonical_hash_only() const {
         const uint8_t* __restrict__ p = pits;
         // Interleaved computation: access same table row for orig+refl
         // to maximize cache line reuse
@@ -175,7 +175,7 @@ struct BaoState {
     }
 
     // ---- Move generation (inline) ----
-    inline int generate_moves(Move out[MAX_MOVES]) const {
+    __attribute__((hot)) inline int generate_moves(Move out[MAX_MOVES]) const {
         const uint8_t* p = &pits[0];
         int n_mtaji = 0;
 
@@ -232,7 +232,7 @@ struct BaoState {
     }
 
     // ---- Sow (inline) ----
-    inline int sow(int start_idx, int count, int dir) {
+    __attribute__((hot)) inline int sow(int start_idx, int count, int dir) {
         uint8_t* __restrict__ p = &pits[0];
         int step = (dir + PITS_PER_SIDE) & 15;
 
@@ -271,7 +271,7 @@ struct BaoState {
     }
 
     // ---- Move execution (inline) ----
-    inline MoveResult make_move(const Move& m) {
+    __attribute__((hot)) inline MoveResult make_move(const Move& m) {
         int current_dir = m.dir;
         int sow_start = m.pit;
         int total_sown = 0;
@@ -325,10 +325,12 @@ struct BaoState {
     // ---- Terminal detection (inline) ----
     inline bool is_terminal() const {
         if (inner_empty(0)) return true;
-        const uint8_t* p = &pits[0];
-        for (int i = 0; i < PITS_PER_SIDE; ++i)
-            if (p[i] >= 2) return false;
-        return true;
+        // Check if any of the 16 pits of side 0 has value >= 2.
+        // A byte is >= 2 iff any bit other than bit 0 is set, i.e. (byte & 0xFE) != 0.
+        uint64_t v0, v1;
+        memcpy(&v0, &pits[0], 8);
+        memcpy(&v1, &pits[8], 8);
+        return ((v0 | v1) & 0xFEFEFEFEFEFEFEFEULL) == 0;
     }
 
     // ---- Debug ----
