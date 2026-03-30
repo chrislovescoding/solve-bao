@@ -323,6 +323,7 @@ static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
 
             if (succs[i].is_terminal()) {
                 stats.terminal++;
+                g_terminal.fetch_add(1, std::memory_order_relaxed);
             } else {
                 my_work.stack.push_back(succs[i]);
             }

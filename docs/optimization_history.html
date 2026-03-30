@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bao Solver — Optimization History</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0d1117; color: #c9d1d9; max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { color: #58a6ff; }
+  h2 { color: #8b949e; margin-top: 40px; }
+  .chart-container { background: #161b22; border-radius: 8px; padding: 20px; margin: 20px 0; }
+  canvas { max-height: 500px; }
+  table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+  th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; }
+  th { background: #21262d; color: #58a6ff; }
+  tr:nth-child(even) { background: #161b22; }
+  .kept { color: #3fb950; }
+  .reverted { color: #f85149; }
+  .neutral { color: #8b949e; }
+  .stat { font-size: 2em; color: #58a6ff; font-weight: bold; }
+  .stat-label { color: #8b949e; font-size: 0.9em; }
+  .stats-row { display: flex; gap: 40px; margin: 20px 0; }
+  .stat-box { text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Bao la Kujifunza — Optimization History</h1>
+
+<div class="stats-row">
+  <div class="stat-box">
+    <div class="stat">2.8M → 27.5M</div>
+    <div class="stat-label">states/sec (single-threaded → 32-thread production)</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat">~10x</div>
+    <div class="stat-label">total speedup from all optimizations</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat">35</div>
+    <div class="stat-label">optimization attempts across 2 sessions</div>
+  </div>
+</div>
+
+<h2>Session 1: Single-Threaded Engine Optimizations</h2>
+<div class="chart-container">
+  <canvas id="chart1"></canvas>
+</div>
+
+<h2>Session 2: Parallel / Multi-Threaded Optimizations</h2>
+<div class="chart-container">
+  <canvas id="chart2"></canvas>
+</div>
+
+<h2>Production Enumerator Speed Over Time</h2>
+<div class="chart-container">
+  <canvas id="chart3"></canvas>
+</div>
+
+<h2>Full Optimization Log</h2>
+
+<h3>Session 1: Engine (single-threaded, benchmark --states 2M)</h3>
+<table>
+  <tr><th>#</th><th>Optimization</th><th>Throughput</th><th>Change</th><th>Status</th></tr>
+  <tr><td>0</td><td>Baseline (original engine)</td><td>2.80M</td><td>—</td><td class="neutral">baseline</td></tr>
+  <tr><td>1</td><td>LTO (-flto)</td><td>2.80M</td><td>+0%</td><td class="neutral">removed later</td></tr>
+  <tr><td>2</td><td>Unrolled + interleaved Zobrist hash</td><td>3.92M</td><td>+40%</td><td class="kept">KEPT ★</td></tr>
+  <tr><td>3</td><td>Branchless sow(count=2)</td><td>4.12M</td><td>+5%</td><td class="kept">KEPT</td></tr>
+  <tr><td>4</td><td>SWAR is_terminal</td><td>3.50M</td><td>-15%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>5</td><td>PGO (profile-guided opt)</td><td>4.33M</td><td>+5%</td><td class="neutral">inconclusive, removed</td></tr>
+  <tr><td>6</td><td>Flatten generate_moves</td><td>4.12M</td><td>0%</td><td class="kept">KEPT (cleaner)</td></tr>
+  <tr><td>7</td><td>Move hot functions to header</td><td>5.48M</td><td>+33%</td><td class="kept">KEPT ★</td></tr>
+  <tr><td>8</td><td>Move remaining functions to header</td><td>5.75M</td><td>+5%</td><td class="kept">KEPT</td></tr>
+  <tr><td>9</td><td>Remove LTO (all inlined now)</td><td>5.98M</td><td>+4%</td><td class="kept">KEPT</td></tr>
+  <tr><td>10</td><td>-funroll-loops</td><td>5.50M</td><td>-8%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>11</td><td>Remove __builtin_expect from sow</td><td>6.10M</td><td>+2%</td><td class="kept">KEPT</td></tr>
+  <tr><td>12</td><td>Custom 32-byte copy constructor</td><td>4.82M</td><td>-21%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>13</td><td>alignas(32) on BaoState</td><td>4.10M</td><td>-33%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>14</td><td>Interleaved Zobrist computation</td><td>6.10M</td><td>0%</td><td class="kept">KEPT</td></tr>
+</table>
+
+<h3>Session 2: Parallel (benchmark_parallel --states 5M, 16 threads)</h3>
+<table>
+  <tr><th>#</th><th>Optimization</th><th>Throughput</th><th>Change</th><th>Status</th></tr>
+  <tr><td>0</td><td>Baseline (post session 1)</td><td>10.40M</td><td>—</td><td class="neutral">baseline</td></tr>
+  <tr><td>1</td><td>PGO (profile-guided opt)</td><td>11.44M</td><td>+10%</td><td class="kept">KEPT ★</td></tr>
+  <tr><td>2</td><td>__attribute__((hot)) on hot funcs</td><td>12.58M</td><td>+10%</td><td class="kept">KEPT ★</td></tr>
+  <tr><td>3</td><td>-funroll-loops (parallel only)</td><td>12.96M</td><td>+3%</td><td class="kept">KEPT</td></tr>
+  <tr><td>4</td><td>LTO (-flto)</td><td>13.48M</td><td>+4%</td><td class="kept">KEPT</td></tr>
+  <tr><td>5</td><td>-fno-exceptions -fno-rtti</td><td>10.38M</td><td>-23%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>6</td><td>-fno-plt</td><td>10.92M</td><td>-19%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>7</td><td>4-way XOR chains in hash</td><td>11.32M</td><td>-16%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>8</td><td>SSE2 swap_sides</td><td>12.54M</td><td>-7%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>9</td><td>Branchless first_sow_captures</td><td>12.67M</td><td>-6%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>10</td><td>sow(count==1) special case</td><td>12.67M</td><td>-6%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>11</td><td>Replace multiply with branch</td><td>12.81M</td><td>-5%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>12</td><td>alignas(64) Zobrist table</td><td>12.13M</td><td>-10%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>13</td><td>Zobrist prefetch in hash loop</td><td>13.48M</td><td>0%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>14</td><td>sow(count==3) special case</td><td>13.48M</td><td>0%</td><td class="reverted">REVERTED</td></tr>
+  <tr><td>15</td><td>Branchless is_terminal</td><td>13.55M</td><td>+0.5%</td><td class="kept">KEPT</td></tr>
+</table>
+
+<script>
+// Session 1 data: [attempt_name, throughput_M, kept/reverted/neutral]
+const s1 = [
+  ["Baseline", 2.80],
+  ["LTO", 2.80],
+  ["Unroll Zobrist", 3.92],
+  ["sow(2) branchless", 4.12],
+  ["SWAR is_terminal", 3.50],
+  ["PGO", 4.33],
+  ["Flatten movegen", 4.12],
+  ["Header inline ★", 5.48],
+  ["More header inline", 5.75],
+  ["Remove LTO", 5.98],
+  ["-funroll-loops", 5.50],
+  ["Rm __builtin_expect", 6.10],
+  ["Custom copy ctor", 4.82],
+  ["alignas(32)", 4.10],
+  ["Interleaved Zobrist", 6.10],
+];
+
+// Track the "running best" (what was kept)
+const s1_running = [2.80, 2.80, 3.92, 4.12, 4.12, 4.12, 4.12, 5.48, 5.75, 5.98, 5.98, 6.10, 6.10, 6.10, 6.10];
+
+const s2 = [
+  ["Baseline", 10.40],
+  ["PGO ★", 11.44],
+  ["hot attr ★", 12.58],
+  ["-funroll-loops", 12.96],
+  ["LTO", 13.48],
+  ["-fno-exceptions", 10.38],
+  ["-fno-plt", 10.92],
+  ["4-way XOR", 11.32],
+  ["SSE2 swap", 12.54],
+  ["Branchless captures", 12.67],
+  ["sow(1)", 12.67],
+  ["Multiply→branch", 12.81],
+  ["alignas(64) Zobrist", 12.13],
+  ["Zobrist prefetch", 13.48],
+  ["sow(3)", 13.48],
+  ["Branchless terminal", 13.55],
+];
+
+const s2_running = [10.40, 11.44, 12.58, 12.96, 13.48, 13.48, 13.48, 13.48, 13.48, 13.48, 13.48, 13.48, 13.48, 13.48, 13.48, 13.55];
+
+// Chart 1: Session 1
+new Chart(document.getElementById('chart1'), {
+  type: 'line',
+  data: {
+    labels: s1.map(x => x[0]),
+    datasets: [
+      {
+        label: 'Attempt throughput',
+        data: s1.map(x => x[1]),
+        borderColor: '#8b949e',
+        backgroundColor: s1.map((x, i) => {
+          if (s1_running[i] > (i > 0 ? s1_running[i-1] : 0)) return '#3fb950';
+          if (x[1] < (i > 0 ? s1_running[i-1] : x[1])) return '#f85149';
+          return '#8b949e';
+        }),
+        pointBackgroundColor: s1.map((x, i) => {
+          if (i === 0) return '#58a6ff';
+          if (x[1] >= s1_running[i]) return '#3fb950';
+          return '#f85149';
+        }),
+        pointRadius: 6,
+        pointHoverRadius: 8,
+        tension: 0,
+        borderDash: [5, 5],
+      },
+      {
+        label: 'Running best (kept)',
+        data: s1_running,
+        borderColor: '#3fb950',
+        backgroundColor: 'rgba(63, 185, 80, 0.1)',
+        pointRadius: 4,
+        tension: 0.2,
+        fill: true,
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      title: { display: true, text: 'Single-Threaded Engine (states/sec in millions)', color: '#c9d1d9' },
+      legend: { labels: { color: '#c9d1d9' } }
+    },
+    scales: {
+      x: { ticks: { color: '#8b949e', maxRotation: 45 }, grid: { color: '#21262d' } },
+      y: { ticks: { color: '#8b949e', callback: v => v.toFixed(1) + 'M' }, grid: { color: '#21262d' },
+           title: { display: true, text: 'states/sec (millions)', color: '#8b949e' } }
+    }
+  }
+});
+
+// Chart 2: Session 2
+new Chart(document.getElementById('chart2'), {
+  type: 'line',
+  data: {
+    labels: s2.map(x => x[0]),
+    datasets: [
+      {
+        label: 'Attempt throughput',
+        data: s2.map(x => x[1]),
+        borderColor: '#8b949e',
+        pointBackgroundColor: s2.map((x, i) => {
+          if (i === 0) return '#58a6ff';
+          if (x[1] >= s2_running[i]) return '#3fb950';
+          return '#f85149';
+        }),
+        pointRadius: 6,
+        pointHoverRadius: 8,
+        tension: 0,
+        borderDash: [5, 5],
+      },
+      {
+        label: 'Running best (kept)',
+        data: s2_running,
+        borderColor: '#3fb950',
+        backgroundColor: 'rgba(63, 185, 80, 0.1)',
+        pointRadius: 4,
+        tension: 0.2,
+        fill: true,
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      title: { display: true, text: 'Parallel (16 threads, states/sec in millions)', color: '#c9d1d9' },
+      legend: { labels: { color: '#c9d1d9' } }
+    },
+    scales: {
+      x: { ticks: { color: '#8b949e', maxRotation: 45 }, grid: { color: '#21262d' } },
+      y: { ticks: { color: '#8b949e', callback: v => v.toFixed(1) + 'M' }, grid: { color: '#21262d' },
+           title: { display: true, text: 'states/sec (millions)', color: '#8b949e' } }
+    }
+  }
+});
+
+// Chart 3: Production speed milestones
+const prod = [
+  ["v1 single-thread\n(RunPod)", 1.3],
+  ["v1 parallel\n32 threads", 9.3],
+  ["v2 parallel\n32 threads", 11.4],
+  ["v3 + optimizations\n32 threads (RunPod)", 12.2],
+  ["v3 + PGO/LTO\n32 threads (GCP)", 27.5],
+];
+
+new Chart(document.getElementById('chart3'), {
+  type: 'bar',
+  data: {
+    labels: prod.map(x => x[0]),
+    datasets: [{
+      label: 'Production enumerator (M states/sec)',
+      data: prod.map(x => x[1]),
+      backgroundColor: ['#21262d', '#1f6feb', '#1f6feb', '#3fb950', '#3fb950'],
+      borderColor: ['#30363d', '#58a6ff', '#58a6ff', '#3fb950', '#3fb950'],
+      borderWidth: 1,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      title: { display: true, text: 'Production Enumerator Speed Over Time', color: '#c9d1d9' },
+      legend: { display: false }
+    },
+    scales: {
+      x: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
+      y: { ticks: { color: '#8b949e', callback: v => v + 'M' }, grid: { color: '#21262d' },
+           title: { display: true, text: 'states/sec (millions)', color: '#8b949e' } }
+    }
+  }
+});
+</script>
+
+</body>
+</html>
