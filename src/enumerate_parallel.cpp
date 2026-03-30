@@ -146,8 +146,12 @@ private:
 // Canonicalize
 // ---------------------------------------------------------------------------
 
-static inline void canonicalize_state(BaoState& s) {
-    s.canonicalize_and_hash();
+// For enumeration: compute canonical hash without modifying the state.
+// The state stays in whatever orientation make_move left it.
+// This is safe because both orientations generate the same set of
+// canonical successor hashes.
+static inline uint64_t canonical_hash(const BaoState& s) {
+    return s.canonical_hash_only();
 }
 
 // ---------------------------------------------------------------------------
@@ -287,8 +291,7 @@ static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
                 continue;
             }
 
-            canonicalize_state(succs[valid]);
-            hashes[valid] = succs[valid].hash;
+            hashes[valid] = canonical_hash(succs[valid]);
             valid++;
         }
 
@@ -302,18 +305,24 @@ static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
                 continue;
 
             stats.states++;
-            size_t total = g_states.fetch_add(1, std::memory_order_relaxed) + 1;
 
-            if (__builtin_expect((total & 0xFFFFF) == 0, 0)) {
-                if (visited.load() > 0.75) {
-                    g_table_full.store(true, std::memory_order_relaxed);
-                    return;
+            // Batch atomic updates: flush every 1024 states to reduce
+            // cache-line bouncing on the shared counter
+            if (__builtin_expect((stats.states & 0x3FF) == 0, 0)) {
+                g_states.fetch_add(1024, std::memory_order_relaxed);
+
+                // Check load factor every ~1M states per thread
+                if ((stats.states & 0xFFFFF) == 0) {
+                    if (visited.count() > visited.capacity() * 3 / 4) {
+                        g_states.fetch_add(stats.states & 0x3FF, std::memory_order_relaxed);
+                        g_table_full.store(true, std::memory_order_relaxed);
+                        return;
+                    }
                 }
             }
 
             if (succs[i].is_terminal()) {
                 stats.terminal++;
-                g_terminal.fetch_add(1, std::memory_order_relaxed);
             } else {
                 my_work.stack.push_back(succs[i]);
             }
@@ -365,8 +374,8 @@ int main(int argc, char* argv[]) {
 
     BaoState start;
     start.init_start();
-    canonicalize_state(start);
-    visited.insert(start.hash);
+    uint64_t start_h = canonical_hash(start);
+    visited.insert(start_h);
     g_states.store(1, std::memory_order_relaxed);
     warmup_stack.push_back(start);
 
@@ -386,11 +395,14 @@ int main(int argc, char* argv[]) {
             BaoState succ = st;
             MoveResult r = succ.make_move(moves[i]);
             if (r != MoveResult::OK) continue;
-            canonicalize_state(succ);
-            if (!visited.insert(succ.hash)) continue;
+            uint64_t h = canonical_hash(succ);
+            if (!visited.insert(h)) continue;
             warmup_states++;
             g_states.fetch_add(1, std::memory_order_relaxed);
-            warmup_stack.push_back(succ);
+            if (!succ.is_terminal())
+                warmup_stack.push_back(succ);
+            else
+                g_terminal.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -434,13 +446,15 @@ int main(int argc, char* argv[]) {
     g_done.store(true, std::memory_order_relaxed);
     report_thread.join();
 
-    // --- Results ---
-    size_t total_states   = g_states.load();
-    size_t total_terminal = g_terminal.load();
+    // --- Results (use thread-local stats for exact counts) ---
+    size_t total_states = warmup_states;
+    size_t total_terminal = 0;
     size_t total_moves = 0, total_infinite = 0, total_inner = 0;
     size_t peak_stack = 0, total_steals = 0;
 
     for (int t = 0; t < num_threads; ++t) {
+        total_states   += thread_stats[t].states;
+        total_terminal += thread_stats[t].terminal;
         total_moves    += thread_stats[t].moves;
         total_infinite += thread_stats[t].infinite;
         total_inner    += thread_stats[t].inner_row_end;

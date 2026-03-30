@@ -115,10 +115,14 @@ struct BaoState {
     void rehash() { hash = compute_hash(); }
 
     // Fused canonicalize + hash: computes both original and reflected hashes
-    // in a single pass (32 Zobrist lookups, not 64). Applies reflection only
-    // if needed. Returns the canonical hash. ~2x faster than separate
-    // canonicalize + rehash.
+    // in a single pass. Applies reflection only if needed.
     uint64_t canonicalize_and_hash();
+
+    // Compute canonical hash WITHOUT modifying state. For enumeration only —
+    // the state stays in its original (possibly non-canonical) orientation.
+    // Both orientations generate the same set of canonical successor hashes,
+    // so this is safe for counting reachable states.
+    uint64_t canonical_hash_only() const;
 
     // ---- Move generation ----
     int generate_moves(Move out[MAX_MOVES]) const;
