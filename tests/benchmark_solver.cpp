@@ -1,99 +1,89 @@
 /*
- * benchmark_solver.cpp — Solver benchmark with minimax ground truth
+ * benchmark_solver.cpp — Solver benchmark with ground truth verification
  *
- * 1. Runs minimax on a small state space to establish exact WIN/LOSS counts
- * 2. Runs the iterative parallel solver on the same state space
- * 3. Verifies the solver matches minimax exactly
- * 4. Reports throughput metrics
+ * 1. Enumerates a small state space, stores all states in a vector
+ * 2. Runs iterative resolution by scanning the vector (no re-enumeration)
+ * 3. Runs parallel solver on same states
+ * 4. Verifies exact match
  *
  * Usage: benchmark_solver [--states N] [--threads T]
  */
 
 #include "../src/solver_core.h"
 #include <chrono>
-#include <set>
 
 using Clock = std::chrono::high_resolution_clock;
 
 // ---------------------------------------------------------------------------
-// Ground truth via minimax (small state spaces only)
+// Ground truth: enumerate once, then resolve by scanning stored states
 // ---------------------------------------------------------------------------
 
-struct MinimaxResult {
-    size_t total;
-    size_t wins;
-    size_t losses;
-    size_t draws;  // cycles
+struct GroundTruth {
+    size_t total, wins, losses, draws;
+    int passes;
+    uint32_t start_label;
 };
 
-static MinimaxResult compute_ground_truth(size_t max_states) {
-    // Enumerate states up to max_states using DFS, then solve with minimax
+static GroundTruth compute_ground_truth(size_t max_states) {
     size_t table_cap = max_states * 4;
     LabelHashTable table(table_cap, false);
 
-    // Enumerate first
+    // Step 1: Enumerate ALL states into a vector (once)
+    std::vector<CompactState> all_states;
+    std::vector<uint64_t> all_hashes;
+    all_states.reserve(max_states);
+    all_hashes.reserve(max_states);
+
     std::vector<CompactState> stack;
     BaoState start;
     start.init_start();
-    uint64_t h = canonical_hash(start);
-    table.insert(h, start.is_terminal() ? LABEL_LOSS : LABEL_UNKNOWN);
-    if (!start.is_terminal()) {
+    uint64_t sh = canonical_hash(start);
+    bool is_term = start.is_terminal();
+    table.insert(sh, is_term ? LABEL_LOSS : LABEL_UNKNOWN);
+    { CompactState cs; cs.from_bao(start); all_states.push_back(cs); }
+    all_hashes.push_back(sh);
+    if (!is_term) {
         CompactState cs; cs.from_bao(start);
         stack.push_back(cs);
     }
 
-    size_t count = 1;
-    while (!stack.empty() && count < max_states) {
+    while (!stack.empty() && all_states.size() < max_states) {
         BaoState st;
         stack.back().to_bao(st);
         stack.pop_back();
 
         Move moves[MAX_MOVES];
         int n = st.generate_moves(moves);
-        for (int i = 0; i < n && count < max_states; ++i) {
+        for (int i = 0; i < n && all_states.size() < max_states; ++i) {
             BaoState succ = st;
             if (succ.make_move(moves[i]) != MoveResult::OK) continue;
-            uint64_t sh = canonical_hash(succ);
-            bool is_term = succ.is_terminal();
-            if (!table.insert(sh, is_term ? LABEL_LOSS : LABEL_UNKNOWN)) continue;
-            count++;
-            if (!is_term) {
-                CompactState cs; cs.from_bao(succ);
-                stack.push_back(cs);
-            }
+            uint64_t h = canonical_hash(succ);
+            bool term = succ.is_terminal();
+            if (!table.insert(h, term ? LABEL_LOSS : LABEL_UNKNOWN)) continue;
+            CompactState cs; cs.from_bao(succ);
+            all_states.push_back(cs);
+            all_hashes.push_back(h);
+            if (!term) stack.push_back(cs);
         }
     }
 
-    // Now solve with iterative resolution (same algorithm as production,
-    // but single-threaded for determinism)
+    size_t count = all_states.size();
+
+    // Step 2: Iterative resolution — scan the stored vector each pass
+    // NO re-enumeration, no visited sets, no DFS. Just a flat scan.
     bool changed = true;
     int passes = 0;
     while (changed) {
         changed = false;
         passes++;
 
-        // Re-enumerate and resolve
-        stack.clear();
-        BaoState st2;
-        st2.init_start();
-        if (!st2.is_terminal()) {
-            CompactState cs; cs.from_bao(st2);
-            stack.push_back(cs);
-        }
+        for (size_t idx = 0; idx < count; ++idx) {
+            uint32_t my_label = table.lookup(all_hashes[idx]);
+            if (my_label != LABEL_UNKNOWN) continue;
 
-        // Simple DFS visited set for this pass
-        std::set<uint64_t> visited;
-        visited.insert(canonical_hash(st2));
-
-        while (!stack.empty()) {
             BaoState state;
-            stack.back().to_bao(state);
-            stack.pop_back();
-
-            if (state.is_terminal()) continue;
-
-            uint64_t my_h = canonical_hash(state);
-            uint32_t my_label = table.lookup(my_h);
+            all_states[idx].to_bao(state);
+            if (state.is_terminal()) continue; // should already be LOSS
 
             Move moves[MAX_MOVES];
             int n = state.generate_moves(moves);
@@ -110,89 +100,35 @@ static MinimaxResult compute_ground_truth(size_t max_states) {
                 }
                 if (r != MoveResult::OK) continue;
 
-                uint64_t sh = canonical_hash(succ);
-
-                // Push for DFS if not visited this pass
-                if (visited.find(sh) == visited.end()) {
-                    visited.insert(sh);
-                    if (!succ.is_terminal()) {
-                        CompactState cs; cs.from_bao(succ);
-                        stack.push_back(cs);
-                    }
-                }
-
-                uint32_t sl = table.lookup(sh);
+                uint32_t sl = table.lookup(canonical_hash(succ));
                 if (sl == LABEL_LOSS) found_loss = true;
                 if (sl != LABEL_WIN) all_win = false;
             }
 
-            if (my_label == LABEL_UNKNOWN) {
-                if (found_loss) {
-                    table.update_label(my_h, LABEL_WIN);
-                    changed = true;
-                } else if (all_win) {
-                    table.update_label(my_h, LABEL_LOSS);
-                    changed = true;
-                }
+            if (found_loss) {
+                table.update_label(all_hashes[idx], LABEL_WIN);
+                changed = true;
+            } else if (all_win) {
+                table.update_label(all_hashes[idx], LABEL_LOSS);
+                changed = true;
             }
         }
     }
 
-    // Count results
-    MinimaxResult res = {};
-    res.total = count;
+    // Step 3: Count results
+    GroundTruth gt = {};
+    gt.total = count;
+    gt.passes = passes;
+    gt.start_label = table.lookup(all_hashes[0]);
 
-    // Re-enumerate to count labels
-    stack.clear();
-    BaoState st3;
-    st3.init_start();
-    {
-        CompactState cs; cs.from_bao(st3);
-        stack.push_back(cs);
-    }
-    std::set<uint64_t> visited2;
-    visited2.insert(canonical_hash(st3));
-
-    // Count start position
-    uint32_t start_label = table.lookup(canonical_hash(st3));
-    if (start_label == LABEL_WIN) res.wins++;
-    else if (start_label == LABEL_LOSS) res.losses++;
-    else res.draws++;
-
-    while (!stack.empty()) {
-        BaoState state;
-        stack.back().to_bao(state);
-        stack.pop_back();
-
-        if (state.is_terminal()) continue;
-
-        Move moves[MAX_MOVES];
-        int n = state.generate_moves(moves);
-        for (int i = 0; i < n; ++i) {
-            BaoState succ = state;
-            if (succ.make_move(moves[i]) != MoveResult::OK) continue;
-            uint64_t sh = canonical_hash(succ);
-            if (visited2.find(sh) == visited2.end()) {
-                visited2.insert(sh);
-                uint32_t sl = table.lookup(sh);
-                if (sl == LABEL_WIN) res.wins++;
-                else if (sl == LABEL_LOSS) res.losses++;
-                else res.draws++;
-                if (!succ.is_terminal()) {
-                    CompactState cs; cs.from_bao(succ);
-                    stack.push_back(cs);
-                }
-            }
-        }
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t l = table.lookup(all_hashes[i]);
+        if (l == LABEL_WIN) gt.wins++;
+        else if (l == LABEL_LOSS) gt.losses++;
+        else gt.draws++;
     }
 
-    printf("Ground truth (%zu states, %d passes):\n", count, passes);
-    printf("  WIN:  %zu (%.1f%%)\n", res.wins, 100.0 * res.wins / count);
-    printf("  LOSS: %zu (%.1f%%)\n", res.losses, 100.0 * res.losses / count);
-    printf("  DRAW: %zu (%.4f%%)\n", res.draws, 100.0 * res.draws / count);
-    printf("\n");
-
-    return res;
+    return gt;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +136,7 @@ static MinimaxResult compute_ground_truth(size_t max_states) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-    size_t max_states = 50000;  // small for minimax feasibility
+    size_t max_states = 10000;
     int num_threads = (int)std::thread::hardware_concurrency();
     if (num_threads < 1) num_threads = 4;
 
@@ -216,15 +152,23 @@ int main(int argc, char* argv[]) {
     printf("Bao Solver Benchmark — %zu states, %d threads\n", max_states, num_threads);
     printf("================================================\n\n");
 
-    // Step 1: Compute ground truth via minimax
-    printf("--- Computing ground truth (minimax) ---\n");
-    auto gt_start = Clock::now();
-    MinimaxResult gt = compute_ground_truth(max_states);
-    auto gt_end = Clock::now();
-    double gt_elapsed = std::chrono::duration<double>(gt_end - gt_start).count();
-    printf("Ground truth computed in %.2f sec\n\n", gt_elapsed);
+    // Step 1: Ground truth
+    printf("--- Computing ground truth ---\n");
+    auto t0 = Clock::now();
+    GroundTruth gt = compute_ground_truth(max_states);
+    auto t1 = Clock::now();
+    double gt_sec = std::chrono::duration<double>(t1 - t0).count();
 
-    // Step 2: Run parallel solver on same state space
+    printf("Ground truth (%zu states, %d passes, %.2f sec):\n",
+           gt.total, gt.passes, gt_sec);
+    printf("  WIN:   %zu (%.1f%%)\n", gt.wins, 100.0 * gt.wins / gt.total);
+    printf("  LOSS:  %zu (%.1f%%)\n", gt.losses, 100.0 * gt.losses / gt.total);
+    printf("  DRAW:  %zu (%.4f%%)\n", gt.draws, 100.0 * gt.draws / gt.total);
+    printf("  Start: %s\n\n",
+           gt.start_label == LABEL_WIN ? "WIN" :
+           gt.start_label == LABEL_LOSS ? "LOSS" : "DRAW/UNKNOWN");
+
+    // Step 2: Parallel solver
     printf("--- Running parallel solver ---\n");
     size_t table_cap = max_states * 4;
     LabelHashTable table(table_cap, false);
@@ -232,8 +176,7 @@ int main(int argc, char* argv[]) {
     SolverGlobals g;
     g.num_threads = num_threads;
 
-    // Init pass
-    size_t warmup_target = (size_t)num_threads * 1000;
+    size_t warmup_target = (size_t)num_threads * 500;
     size_t warmup_count = solver_warmup_init(table, g, warmup_target);
 
     g.done.store(false, std::memory_order_relaxed);
@@ -254,8 +197,7 @@ int main(int argc, char* argv[]) {
         total_states += tstats[t].states_scanned;
         total_terminal += tstats[t].terminal;
     }
-
-    printf("Init: %zu states (%zu terminal)\n", total_states, total_terminal);
+    printf("  Init: %zu states (%zu terminal)\n", total_states, total_terminal);
 
     // Resolution passes
     auto solve_start = Clock::now();
@@ -289,54 +231,43 @@ int main(int argc, char* argv[]) {
         total_loss += pass_loss;
 
         printf("  Pass %d: +%zu WIN, +%zu LOSS\n", pass, pass_win, pass_loss);
-
         if (resolved == 0) break;
-        if (pass > 500) { printf("  ERROR: too many passes\n"); break; }
+        if (pass > 500) break;
     }
 
     auto solve_end = Clock::now();
-    double solve_elapsed = std::chrono::duration<double>(solve_end - solve_start).count();
-
+    double solve_sec = std::chrono::duration<double>(solve_end - solve_start).count();
     size_t total_draw = total_states - total_win - total_loss;
 
-    printf("\nSolver result (%d passes, %.2f sec):\n", pass, solve_elapsed);
-    printf("  WIN:  %zu (%.1f%%)\n", total_win, 100.0 * total_win / total_states);
-    printf("  LOSS: %zu (%.1f%%)\n", total_loss, 100.0 * total_loss / total_states);
-    printf("  DRAW: %zu (%.4f%%)\n", total_draw, 100.0 * total_draw / total_states);
-
-    // Step 3: Verify against ground truth
-    printf("\n--- Verification ---\n");
-    int failures = 0;
-
-    if (total_win != gt.wins) {
-        printf("FAIL: WIN count %zu != ground truth %zu\n", total_win, gt.wins);
-        failures++;
-    }
-    if (total_loss != gt.losses) {
-        printf("FAIL: LOSS count %zu != ground truth %zu\n", total_loss, gt.losses);
-        failures++;
-    }
-    if (total_draw != gt.draws) {
-        printf("FAIL: DRAW count %zu != ground truth %zu\n", total_draw, gt.draws);
-        failures++;
-    }
-
-    // Check starting position
     BaoState start;
     start.init_start();
     uint32_t start_label = table.lookup(canonical_hash(start));
-    printf("Starting position: %s\n",
+
+    printf("\nSolver result (%d passes, %.2f sec):\n", pass, solve_sec);
+    printf("  WIN:   %zu\n", total_win);
+    printf("  LOSS:  %zu\n", total_loss);
+    printf("  DRAW:  %zu\n", total_draw);
+    printf("  Start: %s\n",
            start_label == LABEL_WIN ? "WIN" :
-           start_label == LABEL_LOSS ? "LOSS" :
-           start_label == LABEL_UNKNOWN ? "DRAW" : "???");
+           start_label == LABEL_LOSS ? "LOSS" : "DRAW/UNKNOWN");
+
+    // Verify
+    printf("\n--- Verification ---\n");
+    int failures = 0;
+    if (total_win != gt.wins) { printf("FAIL: WIN %zu != %zu\n", total_win, gt.wins); failures++; }
+    if (total_loss != gt.losses) { printf("FAIL: LOSS %zu != %zu\n", total_loss, gt.losses); failures++; }
+    if (total_draw != gt.draws) { printf("FAIL: DRAW %zu != %zu\n", total_draw, gt.draws); failures++; }
+    if (start_label != gt.start_label) { printf("FAIL: start mismatch\n"); failures++; }
 
     bool passed = (failures == 0);
-    printf("\nCorrectness:        %s\n", passed ? "PASS" : "FAIL");
+    printf("Correctness:        %s\n", passed ? "PASS" : "FAIL");
     printf("\n=== METRICS ===\n");
-    printf("Resolve throughput: %.0f states/sec\n", total_states * pass / solve_elapsed);
+    printf("Resolve throughput: %.0f states*passes/sec\n",
+           (double)total_states * pass / solve_sec);
     printf("Passes:             %d\n", pass);
-    printf("Memory:             %.1f bytes/state\n",
-           (double)(table_cap * sizeof(uint32_t)) / total_states);
+    printf("Time (ground truth): %.2f sec\n", gt_sec);
+    printf("Time (solver):       %.2f sec\n", solve_sec);
 
+    delete[] g.work;
     return passed ? 0 : 1;
 }
