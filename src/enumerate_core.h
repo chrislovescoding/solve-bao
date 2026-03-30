@@ -16,6 +16,13 @@
 #include <mutex>
 #include <vector>
 
+#include <immintrin.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#undef INFINITE
+#endif
+
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -91,11 +98,10 @@ public:
         size_t slot = slot_for(h);
         while (true) {
             uint32_t expected = 0;
-            if (table_[slot].compare_exchange_strong(
+            if (table_[slot].compare_exchange_weak(
                     expected, tag,
                     std::memory_order_relaxed,
                     std::memory_order_relaxed)) {
-                count_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             if (expected == tag)
@@ -179,6 +185,52 @@ struct EnumGlobals {
 };
 
 // ---------------------------------------------------------------------------
+// Work stealing (cold path, extracted to reduce hot-path code size)
+// ---------------------------------------------------------------------------
+
+enum class StealResult { STOLEN, ALL_IDLE, RETRY };
+
+__attribute__((noinline, cold))
+static StealResult try_steal(ThreadWork& my_work, ThreadStats& stats,
+                              int tid, EnumGlobals& g, uint32_t& rng) {
+    for (int attempts = 0; attempts < g.num_threads * 2; ++attempts) {
+        rng = rng * 1103515245u + 12345u;
+        int victim = (int)((rng >> 16) % g.num_threads);
+        if (victim == tid) continue;
+        if (!g.work[victim].active.load(std::memory_order_relaxed)) continue;
+
+        std::unique_lock<std::mutex> lock(g.work[victim].mtx, std::try_to_lock);
+        if (!lock.owns_lock()) continue;
+
+        size_t victim_size = g.work[victim].stack.size();
+        if (victim_size < 2) continue;
+
+        size_t steal_count = victim_size / 2;
+        auto begin = g.work[victim].stack.end() - steal_count;
+        auto end = g.work[victim].stack.end();
+        my_work.stack.insert(my_work.stack.end(), begin, end);
+        g.work[victim].stack.erase(begin, end);
+        stats.steals++;
+        return StealResult::STOLEN;
+    }
+
+    my_work.active.store(false, std::memory_order_relaxed);
+    bool all_idle = true;
+    for (int t = 0; t < g.num_threads; ++t) {
+        if (g.work[t].active.load(std::memory_order_relaxed) ||
+            !g.work[t].stack.empty()) {
+            all_idle = false;
+            break;
+        }
+    }
+    if (all_idle) return StealResult::ALL_IDLE;
+    for (int sp = 0; sp < 64; ++sp)
+        _mm_pause();
+    my_work.active.store(true, std::memory_order_relaxed);
+    return StealResult::RETRY;
+}
+
+// ---------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------
 
@@ -187,55 +239,25 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
                         int tid, EnumGlobals& g) {
     stats = {};
     ThreadWork& my_work = g.work[tid];
+    size_t local_terminal_batch = 0;
+    my_work.stack.reserve(100000);
+
+    // Pin thread to a specific logical core for consistent scheduling
+#ifdef _WIN32
+    SetThreadAffinityMask(GetCurrentThread(), 1ULL << (tid % 64));
+#endif
 
     uint32_t rng = (uint32_t)(tid * 2654435761u + 1);
-    auto next_rng = [&]() -> int {
-        rng = rng * 1103515245u + 12345u;
-        return (int)((rng >> 16) % g.num_threads);
-    };
 
     while (!g.table_full.load(std::memory_order_relaxed) &&
            !g.done.load(std::memory_order_relaxed)) {
         BaoState state;
         {
-            if (my_work.stack.empty()) {
-                bool stolen = false;
-                for (int attempts = 0; attempts < g.num_threads * 2; ++attempts) {
-                    int victim = next_rng();
-                    if (victim == tid) continue;
-                    if (!g.work[victim].active.load(std::memory_order_relaxed)) continue;
-
-                    std::unique_lock<std::mutex> lock(g.work[victim].mtx, std::try_to_lock);
-                    if (!lock.owns_lock()) continue;
-
-                    size_t victim_size = g.work[victim].stack.size();
-                    if (victim_size < 2) continue;
-
-                    size_t steal_count = victim_size / 2;
-                    auto begin = g.work[victim].stack.end() - steal_count;
-                    auto end = g.work[victim].stack.end();
-                    my_work.stack.insert(my_work.stack.end(), begin, end);
-                    g.work[victim].stack.erase(begin, end);
-                    stats.steals++;
-                    stolen = true;
-                    break;
-                }
-
-                if (!stolen) {
-                    my_work.active.store(false, std::memory_order_relaxed);
-                    bool all_idle = true;
-                    for (int t = 0; t < g.num_threads; ++t) {
-                        if (g.work[t].active.load(std::memory_order_relaxed) ||
-                            !g.work[t].stack.empty()) {
-                            all_idle = false;
-                            break;
-                        }
-                    }
-                    if (all_idle) return;
-                    std::this_thread::yield();
-                    my_work.active.store(true, std::memory_order_relaxed);
-                    continue;
-                }
+            if (__builtin_expect(my_work.stack.empty(), 0)) {
+                StealResult r = try_steal(my_work, stats, tid, g, rng);
+                if (r == StealResult::ALL_IDLE) return;
+                if (r == StealResult::RETRY) continue;
+                // STOLEN: fall through to pop
             }
 
             CompactState cs = my_work.stack.back();
@@ -243,14 +265,15 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
             cs.to_bao(state);
         }
 
-        if (my_work.stack.size() > stats.stack_peak)
-            stats.stack_peak = my_work.stack.size();
-
-        if (state.is_terminal()) {
-            stats.terminal++;
-            g.terminal.fetch_add(1, std::memory_order_relaxed);
-            continue;
+        // Track stack peak (only check occasionally to reduce overhead)
+        if (__builtin_expect((stats.states & 0xFF) == 0, 0)) {
+            if (my_work.stack.size() > stats.stack_peak)
+                stats.stack_peak = my_work.stack.size();
         }
+
+        // Note: is_terminal() check removed here — all states pushed to
+        // the stack are guaranteed non-terminal (checked before push in
+        // both worker and warmup).
 
         Move moves[MAX_MOVES];
         int n = state.generate_moves(moves);
@@ -261,7 +284,7 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
 
         for (int i = 0; i < n; ++i) {
             stats.moves++;
-            succs[valid] = state;
+            memcpy(succs[valid].pits, state.pits, TOTAL_PITS);
             MoveResult r = succs[valid].make_move(moves[i]);
 
             if (__builtin_expect(r != MoveResult::OK, 0)) {
@@ -285,9 +308,21 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
 
             if (__builtin_expect((stats.states & 0x3FF) == 0, 0)) {
                 g.states.fetch_add(1024, std::memory_order_relaxed);
+                if (local_terminal_batch > 0) {
+                    g.terminal.fetch_add(local_terminal_batch, std::memory_order_relaxed);
+                    local_terminal_batch = 0;
+                }
+
+                size_t total = g.states.load(std::memory_order_relaxed);
+
+                // Check benchmark state limit
+                if (__builtin_expect(g.max_states > 0 && total >= g.max_states, 0)) {
+                    g.done.store(true, std::memory_order_relaxed);
+                    return;
+                }
 
                 if ((stats.states & 0xFFFFF) == 0) {
-                    if (visited.count() > visited.capacity() * 3 / 4) {
+                    if (total > visited.capacity() * 3 / 4) {
                         g.states.fetch_add(stats.states & 0x3FF, std::memory_order_relaxed);
                         g.table_full.store(true, std::memory_order_relaxed);
                         return;
@@ -295,18 +330,9 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
                 }
             }
 
-            // Check benchmark state limit
-            if (g.max_states > 0) {
-                size_t total = g.states.load(std::memory_order_relaxed);
-                if (total >= g.max_states) {
-                    g.done.store(true, std::memory_order_relaxed);
-                    return;
-                }
-            }
-
             if (succs[i].is_terminal()) {
                 stats.terminal++;
-                g.terminal.fetch_add(1, std::memory_order_relaxed);
+                local_terminal_batch++;
             } else {
                 CompactState cs;
                 cs.from_bao(succs[i]);

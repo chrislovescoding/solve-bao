@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Wpedantic
-CXXFLAGS_FAST = -std=c++17 -O3 -march=native -Wall -Wextra -flto
+CXXFLAGS_FAST = -std=c++17 -O3 -march=native -Wall -Wextra -flto -fomit-frame-pointer -fno-stack-protector
 
 SRC = src/bao.cpp
 HDR = src/bao.h
@@ -40,14 +40,8 @@ bench_par: build/benchmark_parallel
 build/benchmark: $(BENCH_SRC) $(SRC) $(HDR) | build
 	$(CXX) $(CXXFLAGS_FAST) -o $@ $(BENCH_SRC) $(SRC)
 
-build/benchmark_parallel: $(BENCH_PAR_SRC) $(SRC) $(HDR) | build
+build/benchmark_parallel: $(BENCH_PAR_SRC) $(SRC) $(HDR) src/enumerate_core.h | build
 	$(CXX) $(CXXFLAGS_FAST) -funroll-loops -o $@ $(BENCH_PAR_SRC) $(SRC) -lpthread
-
-# PGO training: use same output name so gcda files match
-pgo_train: | build
-	rm -rf build/pgo
-	$(CXX) $(CXXFLAGS_FAST) -fprofile-generate=build/pgo -o build/benchmark_parallel $(BENCH_PAR_SRC) $(SRC) -lpthread
-	-./build/benchmark_parallel --states 5000000
 
 build:
 	mkdir -p build

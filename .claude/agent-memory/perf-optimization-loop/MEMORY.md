@@ -1,1 +1,1 @@
-- [Optimization Results](optimization_results.md) — Bao benchmark: ~9.7M par (from 8.2M), ~4.3M ST (from 2.8M), what worked and what didn't
+- [Optimization Results](optimization_results.md) — Bao benchmark: ~65M production score (from ~11M baseline), 6x improvement. Key wins: removing hash count atomic, compiler flags, thread pinning.
