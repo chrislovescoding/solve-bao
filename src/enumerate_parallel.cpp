@@ -180,9 +180,19 @@ static std::atomic<bool>   g_done{false};
 static time_t              g_start_time;
 
 // Per-thread stacks + mutexes for work stealing
+// Compact 32-byte state for the DFS stack. Drops the 8-byte hash field
+// since we recompute canonical_hash_only() after popping. Saves 20% stack
+// memory — critical when 32 threads each have millions of entries.
+struct CompactState {
+    uint8_t pits[TOTAL_PITS]; // 32 bytes, no hash
+
+    void from_bao(const BaoState& s) { memcpy(pits, s.pits, TOTAL_PITS); }
+    void to_bao(BaoState& s) const   { memcpy(s.pits, pits, TOTAL_PITS); }
+};
+
 struct alignas(64) ThreadWork {
-    std::vector<BaoState> stack;
-    std::mutex mtx;           // only locked during steal operations
+    std::vector<CompactState> stack;
+    std::mutex mtx;
     std::atomic<bool> active{true};
 };
 
@@ -256,8 +266,9 @@ static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
                 }
             }
 
-            state = my_work.stack.back();
+            CompactState cs = my_work.stack.back();
             my_work.stack.pop_back();
+            cs.to_bao(state);
         }
 
         if (my_work.stack.size() > stats.stack_peak)
@@ -325,7 +336,9 @@ static void worker(AtomicHashSet& visited, ThreadStats& stats, int tid) {
                 stats.terminal++;
                 g_terminal.fetch_add(1, std::memory_order_relaxed);
             } else {
-                my_work.stack.push_back(succs[i]);
+                CompactState cs;
+                cs.from_bao(succs[i]);
+                my_work.stack.push_back(cs);
             }
         }
     }
@@ -370,7 +383,7 @@ int main(int argc, char* argv[]) {
     size_t warmup_target = (size_t)num_threads * 10000;
     fprintf(stderr, "Warmup (target %zu stack entries)...\n", warmup_target);
 
-    std::vector<BaoState> warmup_stack;
+    std::vector<CompactState> warmup_stack;
     warmup_stack.reserve(warmup_target * 2);
 
     BaoState start;
@@ -378,11 +391,12 @@ int main(int argc, char* argv[]) {
     uint64_t start_h = canonical_hash(start);
     visited.insert(start_h);
     g_states.store(1, std::memory_order_relaxed);
-    warmup_stack.push_back(start);
+    { CompactState cs; cs.from_bao(start); warmup_stack.push_back(cs); }
 
     size_t warmup_states = 1;
     while (warmup_stack.size() < warmup_target && !warmup_stack.empty()) {
-        BaoState st = warmup_stack.back();
+        BaoState st;
+        warmup_stack.back().to_bao(st);
         warmup_stack.pop_back();
 
         if (st.is_terminal()) {
@@ -400,10 +414,12 @@ int main(int argc, char* argv[]) {
             if (!visited.insert(h)) continue;
             warmup_states++;
             g_states.fetch_add(1, std::memory_order_relaxed);
-            if (!succ.is_terminal())
-                warmup_stack.push_back(succ);
-            else
+            if (!succ.is_terminal()) {
+                CompactState cs; cs.from_bao(succ);
+                warmup_stack.push_back(cs);
+            } else {
                 g_terminal.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -478,7 +494,7 @@ int main(int argc, char* argv[]) {
     printf("Inner-row wins:    %zu\n", total_inner);
     printf("Work steals:       %zu\n", total_steals);
     printf("Peak stack/thread: %zu (%zu MB)\n",
-           peak_stack, peak_stack * sizeof(BaoState) / (1024*1024));
+           peak_stack, peak_stack * sizeof(CompactState) / (1024*1024));
     printf("Hash load:         %.4f\n", visited.load());
     printf("Elapsed:           %.1f sec\n", elapsed);
     if (elapsed > 0)
