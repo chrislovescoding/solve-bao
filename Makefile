@@ -8,7 +8,9 @@ TEST_SRC = tests/test_engine.cpp
 ENUM_SRC = src/enumerate.cpp
 ENUM_PAR_SRC = src/enumerate_parallel.cpp
 
-.PHONY: all test enumerate enumerate_par clean
+BENCH_SRC = tests/benchmark.cpp
+
+.PHONY: all test enumerate enumerate_par bench clean
 
 all: test enumerate enumerate_par
 
@@ -27,6 +29,12 @@ build/enumerate: $(ENUM_SRC) $(SRC) $(HDR) | build
 
 build/enumerate_par: $(ENUM_PAR_SRC) $(SRC) $(HDR) | build
 	$(CXX) $(CXXFLAGS_FAST) -o $@ $(ENUM_PAR_SRC) $(SRC) -lpthread
+
+bench: build/benchmark
+	./build/benchmark
+
+build/benchmark: $(BENCH_SRC) $(SRC) $(HDR) | build
+	$(CXX) $(CXXFLAGS_FAST) -o $@ $(BENCH_SRC) $(SRC)
 
 build:
 	mkdir -p build
