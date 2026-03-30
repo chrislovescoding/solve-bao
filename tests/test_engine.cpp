@@ -203,8 +203,11 @@ TEST(test_hash_after_move) {
     for (int i = 0; i < n; ++i) {
         BaoState copy = s;
         MoveResult r = copy.make_move(moves[i]);
-        if (r == MoveResult::OK)
+        if (r == MoveResult::OK) {
+            // make_move no longer auto-hashes (deferred to canonicalize)
+            copy.rehash();
             ASSERT_EQ(copy.hash, copy.compute_hash());
+        }
     }
 }
 
@@ -463,6 +466,7 @@ TEST(test_stress_random_games) {
             if (r == MoveResult::INNER_ROW_EMPTY) break;
 
             ASSERT_EQ(s.total_seeds(), 64);
+            s.rehash(); // make_move no longer auto-hashes
             ASSERT_EQ(s.hash, s.compute_hash());
             ply++;
         }

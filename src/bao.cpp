@@ -59,7 +59,8 @@ void BaoState::swap_sides() {
     memcpy(tmp,                   &pits[0],             PITS_PER_SIDE);
     memcpy(&pits[0],              &pits[PITS_PER_SIDE], PITS_PER_SIDE);
     memcpy(&pits[PITS_PER_SIDE],  tmp,                  PITS_PER_SIDE);
-    rehash();
+    // NOTE: does NOT rehash. Caller must rehash when needed.
+    // This avoids redundant hashing when canonicalize follows immediately.
 }
 
 void BaoState::reflect_lr() {
@@ -70,7 +71,7 @@ void BaoState::reflect_lr() {
             tmp[REFLECT[i]] = p[i];
         memcpy(p, tmp, PITS_PER_SIDE);
     }
-    rehash();
+    // NOTE: does NOT rehash. Caller must rehash when needed.
 }
 
 bool BaoState::canonicalize() {
@@ -263,8 +264,9 @@ MoveResult BaoState::make_move(const Move& m) {
         sow_start = (landing + current_dir + PITS_PER_SIDE) & 15;
     }
 
-    // Move done. Switch sides, recompute hash once.
-    swap_sides(); // swap_sides() calls rehash()
+    // Move done. Switch sides. Do NOT rehash here —
+    // the enumerator will rehash after canonicalization.
+    swap_sides();
     return MoveResult::OK;
 }
 
