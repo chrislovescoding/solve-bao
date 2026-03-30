@@ -1,0 +1,1 @@
+- [Optimization Results](optimization_results.md) — Bao benchmark: ~4.7M states/sec (from 2.8M baseline), what worked and what didn't
