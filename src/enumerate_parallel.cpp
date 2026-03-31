@@ -64,11 +64,20 @@ int main(int argc, char* argv[]) {
             size_t new_states = s - prev_states;
             bool is_draining = g.draining.load(std::memory_order_relaxed);
 
+            // Sample stack sizes (just reads, no writes to worker data)
+            size_t total_stack = 0;
+            int active_threads = 0;
+            for (int i = 0; i < g.num_threads; ++i) {
+                size_t sz = g.work[i].stack.size();
+                total_stack += sz;
+                if (sz > 0) active_threads++;
+            }
+
             fprintf(stderr,
-                "\r  States: %12zu | Terminal: %10zu | Load: %.4f | "
-                "%.1fM st/s | +%zu/2s%s | %.0fs     ",
-                s, t, (double)s / visited.capacity(), rate / 1e6,
-                new_states, is_draining ? " [DRAINING]" : "", elapsed);
+                "\r  States: %12zu | +%zu/2s | Stack: %zuM (%d thr) | "
+                "%.1fM st/s%s | %.0fs     ",
+                s, new_states, total_stack / 1000000, active_threads,
+                rate / 1e6, is_draining ? " [DRAIN]" : "", elapsed);
             fflush(stderr);
 
             // Detect stall: if fewer than 1000 new states in 2 seconds,
