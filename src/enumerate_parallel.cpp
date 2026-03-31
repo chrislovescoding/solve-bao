@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
     std::vector<ThreadStats> thread_stats(num_threads);
     std::vector<std::thread> threads;
 
-    // Reporter + drain detector
+    // Reporter + convergence detector
     std::thread report_thread([&]() {
         size_t prev_states = 0;
         size_t prev_stack = 0;
@@ -67,7 +67,6 @@ int main(int argc, char* argv[]) {
             double elapsed = difftime(time(nullptr), t0);
             double rate = elapsed > 0 ? s / elapsed : 0;
             size_t new_states = s - prev_states;
-            bool is_draining = g.draining.load(std::memory_order_relaxed);
 
             // Sample all thread stats (read-only, no contention)
             size_t total_stack = 0;
@@ -89,47 +88,50 @@ int main(int argc, char* argv[]) {
             long long stack_delta = (long long)total_stack - (long long)prev_stack;
             size_t pop_delta = total_pops - prev_pops;
             size_t push_delta = total_pushes - prev_pushes;
+            size_t ins_delta = total_ins_true - prev_ins_true;
+            size_t dup_delta = total_ins_false - prev_ins_false;
             prev_stack = total_stack;
             prev_pops = total_pops;
             prev_pushes = total_pushes;
 
-            if (is_draining || new_states < 5000000) {
+            if (new_states < 5000000) {
                 // Detailed view during drain/tail
                 fprintf(stderr,
-                    "\r  St:%zu +%zu | Stk:%zuM(%+lldM) pop:%.1fM push:%.1fM | "
-                    "ins:%.1fM dup:%.1fM | %dthr%s %.0fs     ",
+                    "\r  St:%zu +%zu | Stk:%zuM(%+lldK) pop:%.1fK push:%.1fK | "
+                    "ins:%.1fK dup:%.1fK | %dthr %.0fs     ",
                     s, new_states, total_stack / 1000000,
-                    stack_delta / 1000000, pop_delta / 1e6, push_delta / 1e6,
-                    (total_ins_true - prev_ins_true) / 1e6,
-                    (total_ins_false - prev_ins_false) / 1e6,
-                    active_threads,
-                    is_draining ? " DRAIN" : "", elapsed);
+                    stack_delta / 1000, pop_delta / 1e3, push_delta / 1e3,
+                    ins_delta / 1e3, dup_delta / 1e3,
+                    active_threads, elapsed);
             } else {
                 // Compact view during exploration
                 fprintf(stderr,
                     "\r  St: %12zu | +%zu/2s | Stk: %zuM (%+lldM/2s, %d thr) | "
-                    "%.1fM/s%s | %.0fs     ",
+                    "%.1fM/s | %.0fs     ",
                     s, new_states, total_stack / 1000000,
                     stack_delta / 1000000, active_threads,
-                    rate / 1e6, is_draining ? " [DRAIN]" : "", elapsed);
+                    rate / 1e6, elapsed);
             }
-            prev_ins_true = total_ins_true;
-            prev_ins_false = total_ins_false;
             fflush(stderr);
 
-            // Detect stall: if fewer than 1000 new states in 2 seconds,
-            // for 3 consecutive checks (6 seconds total), enable drain mode.
-            // This stops work stealing so threads can drain their stacks.
-            if (new_states < 500000 && s > 1000000000) {
+            // Detect convergence: if zero new inserts for 15 consecutive
+            // checks (30 seconds), discovery is truly complete. Unlike the
+            // old drain mode, this lets work stealing continue so all
+            // reachable states are found before stopping.
+            if (ins_delta == 0 && s > 1000000000) {
                 stall_count++;
-                if (stall_count >= 3 && !is_draining) {
-                    g.draining.store(true, std::memory_order_relaxed);
-                    fprintf(stderr, "\n  >>> Discovery stalled. Enabling drain mode. <<<\n");
+                if (stall_count >= 15) {
+                    g.done.store(true, std::memory_order_relaxed);
+                    fprintf(stderr,
+                        "\n\n  >>> Discovery converged (0 new inserts for 30s). "
+                        "Stopping. <<<\n");
                 }
             } else {
                 stall_count = 0;
             }
 
+            prev_ins_true = total_ins_true;
+            prev_ins_false = total_ins_false;
             prev_states = s;
         }
     });
@@ -159,7 +161,42 @@ int main(int argc, char* argv[]) {
             peak_stack = thread_stats[t].stack_peak;
     }
 
-    bool complete = !g.table_full.load();
+    // Count remaining unprocessed stack entries
+    size_t remaining_stack = 0;
+    for (int t = 0; t < num_threads; ++t)
+        remaining_stack += g.work[t].stack.size();
+
+    // Verify sample: check that unprocessed states' successors are all known
+    size_t verify_missed = 0;
+    if (remaining_stack > 0) {
+        size_t sample_limit = std::min((size_t)1000000, remaining_stack);
+        size_t verified = 0;
+        fprintf(stderr, "\nVerifying %zuK of %zuM unprocessed stack entries...\n",
+                sample_limit / 1000, remaining_stack / 1000000);
+        for (int t = 0; t < num_threads && verified < sample_limit; ++t) {
+            for (size_t i = 0; i < g.work[t].stack.size() && verified < sample_limit; ++i) {
+                BaoState state;
+                g.work[t].stack[i].to_bao(state);
+                Move moves[MAX_MOVES];
+                int nm = state.generate_moves(moves);
+                for (int j = 0; j < nm; ++j) {
+                    BaoState succ = state;
+                    if (succ.make_move(moves[j]) != MoveResult::OK) continue;
+                    if (visited.insert(canonical_hash(succ))) {
+                        verify_missed++;
+                        total_states++;
+                    }
+                }
+                verified++;
+            }
+        }
+        if (verify_missed == 0)
+            fprintf(stderr, "  Verified: all %zu sampled states' successors in table.\n", verified);
+        else
+            fprintf(stderr, "  WARNING: %zu new states found in verification!\n", verify_missed);
+    }
+
+    bool complete = !g.table_full.load() && verify_missed == 0;
     double elapsed = difftime(time(nullptr), t0);
 
     fprintf(stderr, "\n\n%s\n", complete ? "COMPLETE." : "INCOMPLETE.");
@@ -172,6 +209,7 @@ int main(int argc, char* argv[]) {
     printf("Infinite moves:    %zu\n", total_infinite);
     printf("Inner-row wins:    %zu\n", total_inner);
     printf("Work steals:       %zu\n", total_steals);
+    printf("Unprocessed stack: %zuM\n", remaining_stack / 1000000);
     printf("Peak stack/thread: %zu (%zu MB)\n",
            peak_stack, peak_stack * sizeof(CompactState) / (1024*1024));
     printf("Hash load:         %.4f\n", (double)total_states / visited.capacity());

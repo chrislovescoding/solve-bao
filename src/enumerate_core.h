@@ -260,12 +260,6 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
         BaoState state;
         {
             if (__builtin_expect(my_work.stack.empty(), 0)) {
-                // If draining (no new states being found), don't steal —
-                // just let this thread finish. Prevents endless redistribution
-                // of stale stack entries between threads.
-                if (g.draining.load(std::memory_order_relaxed))
-                    return;
-
                 StealResult r = try_steal(my_work, stats, tid, g, rng);
                 if (r == StealResult::ALL_IDLE) return;
                 if (r == StealResult::RETRY) continue;
