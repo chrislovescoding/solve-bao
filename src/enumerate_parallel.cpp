@@ -53,6 +53,7 @@ int main(int argc, char* argv[]) {
     // Reporter + drain detector
     std::thread report_thread([&]() {
         size_t prev_states = 0;
+        size_t prev_stack = 0;
         int stall_count = 0;
         while (!g.done.load(std::memory_order_relaxed) &&
                !g.table_full.load(std::memory_order_relaxed)) {
@@ -73,10 +74,14 @@ int main(int argc, char* argv[]) {
                 if (sz > 0) active_threads++;
             }
 
+            long long stack_delta = (long long)total_stack - (long long)prev_stack;
+            prev_stack = total_stack;
+
             fprintf(stderr,
-                "\r  States: %12zu | +%zu/2s | Stack: %zuM (%d thr) | "
-                "%.1fM st/s%s | %.0fs     ",
-                s, new_states, total_stack / 1000000, active_threads,
+                "\r  St: %12zu | +%zu/2s | Stk: %zuM (%+lldM/2s, %d thr) | "
+                "%.1fM/s%s | %.0fs     ",
+                s, new_states, total_stack / 1000000,
+                stack_delta / 1000000, active_threads,
                 rate / 1e6, is_draining ? " [DRAIN]" : "", elapsed);
             fflush(stderr);
 
