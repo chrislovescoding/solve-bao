@@ -150,14 +150,17 @@ static inline uint64_t canonical_hash(const BaoState& s) {
 // ---------------------------------------------------------------------------
 
 struct alignas(64) ThreadStats {
-    size_t states       = 0;
-    size_t terminal     = 0;
-    size_t moves        = 0;
-    size_t infinite     = 0;
+    size_t states        = 0;  // new states inserted into hash table
+    size_t terminal      = 0;
+    size_t moves         = 0;
+    size_t infinite      = 0;
     size_t inner_row_end = 0;
-    size_t stack_peak   = 0;
-    size_t steals       = 0;
-    size_t pops         = 0;   // total states popped from stack
+    size_t stack_peak    = 0;
+    size_t steals        = 0;
+    size_t pops          = 0;  // total states popped from stack
+    size_t pushes        = 0;  // total states pushed to stack
+    size_t insert_true   = 0;  // insert() returned true (new)
+    size_t insert_false  = 0;  // insert() returned false (duplicate)
     char _pad[0];
 };
 
@@ -311,9 +314,12 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
             visited.prefetch(hashes[i]);
 
         for (int i = 0; i < valid; ++i) {
-            if (!visited.insert(hashes[i]))
+            if (!visited.insert(hashes[i])) {
+                stats.insert_false++;
                 continue;
+            }
 
+            stats.insert_true++;
             stats.states++;
 
             if (__builtin_expect((stats.states & 0x3FF) == 0, 0)) {
@@ -325,7 +331,6 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
 
                 size_t total = g.states.load(std::memory_order_relaxed);
 
-                // Check benchmark state limit
                 if (__builtin_expect(g.max_states > 0 && total >= g.max_states, 0)) {
                     g.done.store(true, std::memory_order_relaxed);
                     return;
@@ -347,6 +352,7 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
                 CompactState cs;
                 cs.from_bao(succs[i]);
                 my_work.stack.push_back(cs);
+                stats.pushes++;
             }
         }
     }

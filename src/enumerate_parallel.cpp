@@ -55,6 +55,9 @@ int main(int argc, char* argv[]) {
         size_t prev_states = 0;
         size_t prev_stack = 0;
         size_t prev_pops = 0;
+        size_t prev_pushes = 0;
+        size_t prev_ins_true = 0;
+        size_t prev_ins_false = 0;
         int stall_count = 0;
         while (!g.done.load(std::memory_order_relaxed) &&
                !g.table_full.load(std::memory_order_relaxed)) {
@@ -66,27 +69,52 @@ int main(int argc, char* argv[]) {
             size_t new_states = s - prev_states;
             bool is_draining = g.draining.load(std::memory_order_relaxed);
 
-            // Sample stack sizes and pop counts (read-only, no contention)
+            // Sample all thread stats (read-only, no contention)
             size_t total_stack = 0;
             size_t total_pops = 0;
+            size_t total_pushes = 0;
+            size_t total_ins_true = 0;
+            size_t total_ins_false = 0;
             int active_threads = 0;
             for (int i = 0; i < g.num_threads; ++i) {
                 size_t sz = g.work[i].stack.size();
                 total_stack += sz;
                 total_pops += thread_stats[i].pops;
+                total_pushes += thread_stats[i].pushes;
+                total_ins_true += thread_stats[i].insert_true;
+                total_ins_false += thread_stats[i].insert_false;
                 if (sz > 0) active_threads++;
             }
 
             long long stack_delta = (long long)total_stack - (long long)prev_stack;
-            size_t pop_rate = (total_pops - prev_pops);
+            size_t pop_delta = total_pops - prev_pops;
+            size_t push_delta = total_pushes - prev_pushes;
             prev_stack = total_stack;
             prev_pops = total_pops;
+            prev_pushes = total_pushes;
 
-            fprintf(stderr,
-                "\r  St: %zu | +%zu | Stk: %zuM (%+lldM) pop: %.1fM/2s %dthr%s %.0fs     ",
-                s, new_states, total_stack / 1000000,
-                stack_delta / 1000000, pop_rate / 1e6, active_threads,
-                is_draining ? " DRAIN" : "", elapsed);
+            if (is_draining || new_states < 5000000) {
+                // Detailed view during drain/tail
+                fprintf(stderr,
+                    "\r  St:%zu +%zu | Stk:%zuM(%+lldM) pop:%.1fM push:%.1fM | "
+                    "ins:%.1fM dup:%.1fM | %dthr%s %.0fs     ",
+                    s, new_states, total_stack / 1000000,
+                    stack_delta / 1000000, pop_delta / 1e6, push_delta / 1e6,
+                    (total_ins_true - prev_ins_true) / 1e6,
+                    (total_ins_false - prev_ins_false) / 1e6,
+                    active_threads,
+                    is_draining ? " DRAIN" : "", elapsed);
+            } else {
+                // Compact view during exploration
+                fprintf(stderr,
+                    "\r  St: %12zu | +%zu/2s | Stk: %zuM (%+lldM/2s, %d thr) | "
+                    "%.1fM/s%s | %.0fs     ",
+                    s, new_states, total_stack / 1000000,
+                    stack_delta / 1000000, active_threads,
+                    rate / 1e6, is_draining ? " [DRAIN]" : "", elapsed);
+            }
+            prev_ins_true = total_ins_true;
+            prev_ins_false = total_ins_false;
             fflush(stderr);
 
             // Detect stall: if fewer than 1000 new states in 2 seconds,
