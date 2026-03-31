@@ -157,7 +157,8 @@ struct alignas(64) ThreadStats {
     size_t inner_row_end = 0;
     size_t stack_peak   = 0;
     size_t steals       = 0;
-    char _pad[8];
+    size_t pops         = 0;   // total states popped from stack
+    char _pad[0];
 };
 
 // ---------------------------------------------------------------------------
@@ -271,6 +272,7 @@ static void enum_worker(AtomicHashSet& visited, ThreadStats& stats,
             CompactState cs = my_work.stack.back();
             my_work.stack.pop_back();
             cs.to_bao(state);
+            stats.pops++;
         }
 
         // Track stack peak (only check occasionally to reduce overhead)
