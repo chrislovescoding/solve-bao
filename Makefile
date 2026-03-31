@@ -12,7 +12,7 @@ BENCH_SRC = tests/benchmark.cpp
 BENCH_PAR_SRC = tests/benchmark_parallel.cpp
 BENCH_SOLVER_SRC = tests/benchmark_solver.cpp
 
-.PHONY: all test enumerate enumerate_par solver bench bench_par bench_solver clean
+.PHONY: all test enumerate enumerate_par solver bench bench_par bench_solver bench_move clean
 
 all: test enumerate enumerate_par solver
 
@@ -44,6 +44,9 @@ bench_par: build/benchmark_parallel
 bench_solver: build/benchmark_solver
 	./build/benchmark_solver
 
+bench_move: build/benchmark_make_move
+	./build/benchmark_make_move
+
 build/benchmark: $(BENCH_SRC) $(SRC) $(HDR) | build
 	$(CXX) $(CXXFLAGS_FAST) -o $@ $(BENCH_SRC) $(SRC)
 
@@ -52,6 +55,9 @@ build/benchmark_parallel: $(BENCH_PAR_SRC) $(SRC) $(HDR) src/enumerate_core.h | 
 
 build/benchmark_solver: $(BENCH_SOLVER_SRC) $(SRC) $(HDR) src/solver_core.h | build
 	$(CXX) $(CXXFLAGS_FAST) -funroll-loops -o $@ $(BENCH_SOLVER_SRC) $(SRC) -lpthread
+
+build/benchmark_make_move: tests/benchmark_make_move.cpp $(SRC) $(HDR) | build
+	$(CXX) $(CXXFLAGS_FAST) -funroll-loops -o $@ tests/benchmark_make_move.cpp $(SRC)
 
 build:
 	mkdir -p build
