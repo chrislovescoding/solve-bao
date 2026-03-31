@@ -83,7 +83,7 @@ int main(int argc, char* argv[]) {
             // Detect stall: if fewer than 1000 new states in 2 seconds,
             // for 3 consecutive checks (6 seconds total), enable drain mode.
             // This stops work stealing so threads can drain their stacks.
-            if (new_states < 1000 && s > 1000000) {
+            if (new_states < 500000 && s > 1000000000) {
                 stall_count++;
                 if (stall_count >= 3 && !is_draining) {
                     g.draining.store(true, std::memory_order_relaxed);
