@@ -3,6 +3,37 @@
 #include <algorithm>
 
 // ---------------------------------------------------------------------------
+// Sow lookup table
+// ---------------------------------------------------------------------------
+
+SowEntry SOW_TABLE[2][16][16];
+
+void sow_table_init() {
+    const int steps[2] = {1, 15}; // CW, ACW
+    for (int d = 0; d < 2; ++d) {
+        int step = steps[d];
+        for (int start = 0; start < 16; ++start) {
+            for (int count = 0; count < 16; ++count) {
+                SowEntry& e = SOW_TABLE[d][start][count];
+                memset(e.mask, 0, 16);
+                memset(e.pad, 0, 15);
+                if (count == 0) {
+                    e.landing = (uint8_t)start;
+                    continue;
+                }
+                int idx = start;
+                for (int s = 0; s < count; ++s) {
+                    e.mask[idx]++;
+                    if (s < count - 1)
+                        idx = (idx + step) & 15;
+                }
+                e.landing = (uint8_t)idx;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Zobrist table
 // ---------------------------------------------------------------------------
 
@@ -20,6 +51,7 @@ void zobrist_init(uint64_t seed) {
     for (int p = 0; p < TOTAL_PITS; ++p)
         for (int c = 0; c <= TOTAL_SEEDS; ++c)
             ZOBRIST_TABLE[p][c] = xorshift64(s);
+    sow_table_init();
 }
 
 // ---------------------------------------------------------------------------

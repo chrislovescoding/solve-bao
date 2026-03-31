@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <immintrin.h>
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -48,6 +49,22 @@ static constexpr int REFLECT[16] = {
     7, 6, 5, 4, 3, 2, 1, 0,
     15, 14, 13, 12, 11, 10, 9, 8
 };
+
+// ---------------------------------------------------------------------------
+// Sow lookup tables — precomputed SIMD masks for small-count sowing
+// ---------------------------------------------------------------------------
+
+// Precomputed sow data: for each (dir, start, count) store 16-byte increment mask + landing
+// dir_idx 0 = CW (step=1), dir_idx 1 = ACW (step=15)
+struct alignas(32) SowEntry {
+    alignas(16) uint8_t mask[16];  // increment mask (1 at each pit receiving a seed)
+    uint8_t landing;               // landing pit index
+    uint8_t pad[15];               // pad to 32 bytes for alignment
+};
+
+// SOW_TABLE[dir_idx][start][count]
+extern SowEntry SOW_TABLE[2][16][16];
+void sow_table_init();
 
 // ---------------------------------------------------------------------------
 // Zobrist hashing
@@ -231,95 +248,105 @@ struct BaoState {
         return n_takasa;
     }
 
-    // ---- Sow (inline) ----
+    // ---- Sow (public API, backward compat) ----
     __attribute__((hot)) inline int sow(int start_idx, int count, int dir) {
-        uint8_t* __restrict__ p = &pits[0];
-        int step = (dir + PITS_PER_SIDE) & 15;
-
-        if (count == 2) {
-            int idx1 = start_idx;
-            int idx2 = (start_idx + step) & 15;
-            p[idx1]++;
-            p[idx2]++;
-            return idx2;
-        }
-        if (count < PITS_PER_SIDE) {
-            int idx = start_idx;
-            int remaining = count;
-            while (--remaining > 0) {
-                p[idx]++;
-                idx = (idx + step) & 15;
-            }
-            p[idx]++;
-            return idx;
-        }
-        // Large count: batch
-        int q = count >> 4;
-        int r = count & 15;
-        for (int i = 0; i < PITS_PER_SIDE; ++i)
-            p[i] += (uint8_t)q;
-        if (r == 0)
-            return (start_idx + 15 * step) & 15;
-        int idx = start_idx;
-        int remaining = r;
-        while (--remaining > 0) {
-            p[idx]++;
-            idx = (idx + step) & 15;
-        }
-        p[idx]++;
-        return idx;
+        int dir_idx = (dir == CW) ? 0 : 1;
+        return sow_fast(start_idx, count, dir_idx);
     }
 
-    // ---- Move execution (inline) ----
-    __attribute__((hot)) inline MoveResult make_move(const Move& m) {
-        int current_dir = m.dir;
+    // ---- Sow fast path (inline) — dir_idx precomputed by caller ----
+    // dir_idx: 0=CW, 1=ACW
+    __attribute__((hot)) inline int sow_fast(int start_idx, int count, int dir_idx) {
+        uint8_t* __restrict__ p = &pits[0];
+
+        if (count < PITS_PER_SIDE) {
+            const SowEntry& e = SOW_TABLE[dir_idx][start_idx][count];
+            __m128i v    = _mm_loadu_si128((__m128i*)p);
+            __m128i mask = _mm_load_si128((__m128i*)e.mask);
+            _mm_storeu_si128((__m128i*)p, _mm_add_epi8(v, mask));
+            return e.landing;
+        }
+        int q = count >> 4;
+        int r = count & 15;
+        __m128i v  = _mm_loadu_si128((__m128i*)p);
+        __m128i vq = _mm_set1_epi8((char)q);
+        if (r == 0) {
+            _mm_storeu_si128((__m128i*)p, _mm_add_epi8(v, vq));
+            return (start_idx + (dir_idx == 0 ? 15 : 1)) & 15;
+        }
+        const SowEntry& e = SOW_TABLE[dir_idx][start_idx][r];
+        __m128i mask = _mm_load_si128((__m128i*)e.mask);
+        _mm_storeu_si128((__m128i*)p, _mm_add_epi8(_mm_add_epi8(v, vq), mask));
+        return e.landing;
+    }
+
+    // ---- Move execution (inline, templated on capturing) ----
+    template<bool IS_CAPTURING>
+    __attribute__((hot)) inline MoveResult make_move_impl(const Move& m) {
+        int dir_idx = (m.dir == CW) ? 0 : 1;
+        int step = dir_idx == 0 ? 1 : 15; // precomputed for sow_start update
         int sow_start = m.pit;
         int total_sown = 0;
-        bool is_capturing_move = m.is_mtaji;
 
         int seeds = pits[sow_start];
         pits[sow_start] = 0;
 
         for (;;) {
-            int landing = sow(sow_start, seeds, current_dir);
+            int landing = sow_fast(sow_start, seeds, dir_idx);
             total_sown += seeds;
 
             if (__builtin_expect(total_sown > MAX_SOW_THRESHOLD, 0))
                 return MoveResult::INFINITE;
+
+            uint8_t landing_count = pits[landing];
+
+            if (__builtin_expect(landing_count == 1, 0)) {
+                if (__builtin_expect(inner_empty(0), 0))
+                    return MoveResult::INNER_ROW_EMPTY;
+                break;
+            }
+
             if (__builtin_expect(inner_empty(0), 0))
                 return MoveResult::INNER_ROW_EMPTY;
 
-            uint8_t landing_count = pits[landing];
-            if (landing_count == 1)
-                break;
-
-            if (is_capturing_move && landing < INNER_PITS) {
-                int opp_idx = PITS_PER_SIDE + landing;
-                if (pits[opp_idx] > 0) {
-                    seeds = pits[opp_idx];
-                    pits[opp_idx] = 0;
-                    if (inner_empty(1))
-                        return MoveResult::INNER_ROW_EMPTY;
-                    if (landing <= 1) {
-                        sow_start = KICHWA_L;
-                        current_dir = CW;
-                    } else if (landing >= 6) {
-                        sow_start = KICHWA_R;
-                        current_dir = ACW;
-                    } else {
-                        sow_start = (current_dir == CW) ? KICHWA_L : KICHWA_R;
+            if constexpr (IS_CAPTURING) {
+                if (landing < INNER_PITS) {
+                    int opp_idx = PITS_PER_SIDE + landing;
+                    if (pits[opp_idx] > 0) {
+                        seeds = pits[opp_idx];
+                        pits[opp_idx] = 0;
+                        if (inner_empty(1))
+                            return MoveResult::INNER_ROW_EMPTY;
+                        if (landing <= 1) {
+                            sow_start = KICHWA_L;
+                            step = 1;
+                            dir_idx = 0;
+                        } else if (landing >= 6) {
+                            sow_start = KICHWA_R;
+                            step = 15;
+                            dir_idx = 1;
+                        } else {
+                            sow_start = (dir_idx == 0) ? KICHWA_L : KICHWA_R;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
 
-            seeds = pits[landing];
+            seeds = landing_count;
             pits[landing] = 0;
-            sow_start = (landing + current_dir + PITS_PER_SIDE) & 15;
+            sow_start = (landing + step) & 15;
         }
 
         swap_sides();
         return MoveResult::OK;
+    }
+
+    __attribute__((hot)) inline MoveResult make_move(const Move& m) {
+        if (m.is_mtaji)
+            return make_move_impl<true>(m);
+        else
+            return make_move_impl<false>(m);
     }
 
     // ---- Terminal detection (inline) ----

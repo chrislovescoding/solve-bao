@@ -4,9 +4,14 @@ description: Performance optimization history for the Bao state enumerator bench
 type: project
 ---
 
-## Current Best Performance (2026-03-30)
+## Current Best Performance (2026-03-31)
 
-### Parallel benchmark (make bench_par) — PRIMARY METRIC
+### make_move benchmark (make bench_move) — PRIMARY for sow/relay optimization
+- Throughput: ~20M calls/sec (peak 20.67M), up from 15.68M baseline
+- Improvement: **+28-32% over baseline**
+- Corpus: 5000 deep states (depth >= 20, max_pit >= 16 seeds), 16795 moves
+
+### Parallel benchmark (make bench_par) — PRIMARY for enumeration
 - Production score: ~65M median (21-run), range 61-72M
 - Throughput: ~65M states/sec
 - Stack entry: 32 bytes (CompactState)
@@ -16,53 +21,68 @@ type: project
 - Improvement: **~6x production score increase**
 
 ### Single-threaded benchmark (make bench)
-- Throughput: ~4.5-4.8M states/sec
+- Throughput: ~5.3M states/sec
 - Memory: 33.6 bytes/state
 - Correctness: PASS (exact ground truth)
 
-## Key Optimizations (in order of impact)
+## make_move Optimizations (2026-03-31 session)
+
+### What Worked
+
+#### 1. SIMD lookup table for small-count sow — **+12%** (biggest win)
+Replaced the scalar loop `for(i=0..count-1) p[idx]++; idx=(idx+step)&15` with a precomputed table:
+- `SowEntry` struct: 16-byte mask (which pits to increment) + landing index
+- Table: `SOW_TABLE[2][16][16]` = 512 entries * 32 bytes = 16KB (fits L1)
+- Each sow becomes: load pits, load mask from table, paddb, store pits, return landing
+- This eliminates the data-dependent loop entirely
+
+#### 2. SIMD batch add for count >= 16 — **+3.8%**
+Replaced `for(i=0..15) p[i] += q` with `_mm_add_epi8(v, set1(q))`.
+
+#### 3. Interleaved SowEntry struct — **+3.6%**
+Packing mask[16] and landing in same 32-byte struct (same cache line) improves locality vs separate arrays.
+
+#### 4. Template specialization on is_capturing — **+2.4%**
+`make_move_impl<true>` / `make_move_impl<false>` eliminates the capture branch from the non-capturing (takasa) relay loop via `if constexpr`.
+
+#### 5. Combined batch+remainder SIMD — **+2.4%**
+For count >= 16 with remainder r > 0: merge batch add and remainder into single `paddb(paddb(v, set1(q)), mask[r])` instead of two separate load/add/store pairs.
+
+#### 6. Reorder checks — landing_count before inner_empty — **+2.5%**
+Check `pits[landing] == 1` (single byte read) before `inner_empty(0)` (8-byte read). On last relay iteration, only do inner_empty if about to break.
+
+#### 7. Hoist step computation from sow to make_move — **+1.8%**
+Precompute `step = (dir + 16) & 15` once per make_move, pass to sow instead of recomputing each call.
+
+#### 8. Reuse landing_count — ~0% (compiler CSE)
+Use already-loaded `landing_count` instead of re-reading `pits[landing]` for relay continuation seeds. Compiler likely already did this.
+
+### What Didn't Work (2026-03-31 session)
+
+- **alignas(16) on pits**: -4.9%, struct padded to 48 bytes → increased copy cost
+- **count==2 scalar fast path with SIMD table**: -9%, extra branch worse than uniform SIMD path
+- **PGO (profile-guided optimization)**: -7.7%, profile data mismatch between profiling and optimized binary
+- **SIMD inner_empty from sow result vector**: -4.3%, SSE2 cmpeq+movemask slower than uint64 compare
+- **-fno-exceptions -fno-rtti**: -1.8%, doesn't help single-threaded
+- **-fwhole-program**: ~0%, redundant with -flto
+- **Store-forwarding avoidance (extract landing from SIMD)**: ~0%, tmp array overhead cancels benefit
+- **Fast path for first-sow-no-relay**: -3.5%, extra branch overhead, fast path rarely fires on deep states
+- **__builtin_expect on landing_count==1**: ~0%, branch predictor already handles this
+
+## Key Optimizations for Parallel Benchmark (previous sessions)
 
 ### 1. Remove count_.fetch_add(1) from hash table insert — **5x improvement**
-The AtomicHashSet was incrementing an atomic counter on every successful insert. With 16 threads all hitting this counter, the cache line bounced continuously. Removed the per-insert increment and use g.states (already batched per-1024) for capacity checks instead.
-
 ### 2. Compiler flags: -fomit-frame-pointer -fno-stack-protector — **+62%**
-Freeing the RBP register for general use and removing stack canary checks from every function gave a massive throughput boost to the register-pressure-heavy hot loop.
-
 ### 3. Thread pinning (SetThreadAffinityMask on Windows) — **+4-10%**
-Pin each worker thread to its own logical core (tid % 64). Eliminates the OS scheduler bouncing threads between P-cores and E-cores on hybrid architectures. Also dramatically reduces variance (from 2x range to ~15% range).
-
 ### 4. Batch g.terminal atomic updates — moderate improvement
-Accumulate terminal state counts locally per-thread, flush every 1024 states alongside g.states batch. Reduces atomic contention.
-
 ### 5. Cold noinline work-stealing function — marginal
-Extract work-stealing code to a separate __attribute__((noinline, cold)) function to reduce hot-path instruction cache pressure.
-
 ### 6. Spin-pause before yield — marginal
-Use 64 iterations of _mm_pause() instead of std::this_thread::yield() when no work can be stolen. Avoids OS scheduler quantum penalty.
 
-### 7. Minor optimizations (neutral/marginal)
-- Reserve stack vectors (100K entries)
-- Remove redundant is_terminal() check after pop from stack
-- Fold benchmark limit check into every-1024-states batch
-- Use compare_exchange_weak instead of strong
-- Copy only pits[32] instead of full BaoState(40) for successors
-- Periodic stack_peak tracking (every 256 states instead of every state)
+## What Didn't Work (previous sessions)
 
-## What Didn't Work (2026-03-30 session)
-- **Check-before-CAS in hash table**: Load before CAS added latency for common case (empty slots)
-- **-fno-exceptions -fno-rtti**: -6%, breaks std::mutex performance
-- **Loop fission (separate make_move and hash loops)**: -13%, loses temporal locality on pits
-- **Early prefetch (per-hash instead of batch)**: -11%, reduces memory-level parallelism
-- **24-byte CompactState (6-bit encoding)**: ~0% throughput, encode/decode overhead cancels cache benefit. Memory savings not needed (fits in 512GB either way)
-- **__builtin_expect on hash insert**: -4%, wrong prediction direction
-- **P-cores-only pinning**: Much worse — 16 threads competing for 8 logical cores
-- **Stack prefetch**: 0%, stack data already hot in L1/L2
-- **PGO**: 0%, all hot functions already inlined in header
-
-## What Didn't Work (previous session)
 - **-fno-plt**: -19%, significant regression
 - **SIMD swap_sides (SSE2)**: -7%, compiler generates equivalent uint64 code
-- **4-way parallel XOR chains in hash**: -16%, extra register pressure causes spills
+- **4-way parallel XOR chains in hash**: -16%, extra register pressure
 - **Branchless first_sow_captures**: -6%, branches are well-predicted
 - **Zobrist prefetch within canonical_hash_only**: ~0%, table already in L1
 - **alignas(64) on ZOBRIST_TABLE**: -10%, changes cache-line alignment negatively
@@ -71,9 +91,19 @@ Use 64 iterations of _mm_pause() instead of std::this_thread::yield() when no wo
 - **-funroll-loops for ST**: -8% (but helps parallel!)
 - **Custom copy constructor (32 vs 40 bytes)**: -21%
 - **alignas(32) on BaoState**: terrible (padded to 64 bytes)
+- **Check-before-CAS in hash table**: added latency
+- **-fno-exceptions -fno-rtti**: -6%, breaks std::mutex performance
+- **Loop fission (separate make_move and hash loops)**: -13%
+- **Early prefetch (per-hash instead of batch)**: -11%
+- **24-byte CompactState (6-bit encoding)**: ~0%, encode/decode overhead cancels cache benefit
+- **__builtin_expect on hash insert**: -4%, wrong prediction direction
+- **P-cores-only pinning**: Much worse
+- **Stack prefetch**: 0%
+- **PGO for parallel**: 0%
 
 ## Build Configuration
 - CXXFLAGS_FAST: `-std=c++17 -O3 -march=native -Wall -Wextra -flto -fomit-frame-pointer -fno-stack-protector`
+- bench_move additionally uses: `-funroll-loops`
 - Parallel benchmark additionally uses: `-funroll-loops`
 - Tests built with: `-std=c++17 -O2` (no fast flags)
 
@@ -83,13 +113,16 @@ Use 64 iterations of _mm_pause() instead of std::this_thread::yield() when no wo
 - CompactState is 32 bytes (pits only, no hash)
 - Intel i7-1360P: 4 P-cores (HT=8 threads) + 8 E-cores, 16 total logical cores
 - L1 cache: 48KB, L2: 18432KB, cache line: 64 bytes
-- Hash table insert is the primary bottleneck (~100ns DRAM miss per CAS)
-- Thread pinning reduces variance from ~2x to ~15% range
+- SOW_TABLE: 16KB precomputed sow masks+landing (32-byte aligned SowEntry structs)
+- sow() uses SIMD lookup table for count<16, SIMD batch+remainder for count>=16
+- make_move uses template specialization on is_capturing (IS_CAPTURING template param)
 
 ## System Notes
 - Windows 11, MSYS2/MinGW g++ 15.2.0 at /c/msys64/mingw64/bin/g++
 - -march=native resolves to -march=alderlake -mtune=alderlake
+- AVX2 available but SSE2 sufficient for 16-byte pit operations
 - Windows `windows.h` defines INFINITE macro — need `#undef INFINITE` after include
+- _mm_testz_si128 (SSE4.1) not available in test builds (-O2 without -march=native)
 
 **Why:** Tracking this helps avoid re-trying failed optimizations.
-**How to apply:** Reference before attempting new optimizations. The biggest remaining opportunity is software pipelining (processing 2+ states simultaneously to increase hash table prefetch distance).
+**How to apply:** Reference before attempting new optimizations. The biggest remaining opportunity may be software pipelining (processing 2+ states simultaneously) or reducing the store-forwarding stall after SIMD sow writes.
