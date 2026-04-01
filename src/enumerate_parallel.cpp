@@ -1,22 +1,108 @@
 /*
- * enumerate_parallel.cpp — Production parallel enumerator
+ * enumerate_parallel.cpp — Production parallel enumerator with checkpointing
  *
- * Thin wrapper around enumerate_core.h. All shared logic lives there.
+ * Supports spot/preemptible VMs: saves hash table + stacks to disk
+ * periodically. On restart, loads the checkpoint and continues.
+ *
+ * Usage: ./build/enumerate_par --mem-gb 280 --threads 48 [--checkpoint /mnt/disk/ckpt]
  */
 
 #include "enumerate_core.h"
 #include <ctime>
+#include <string>
+
+// ---------------------------------------------------------------------------
+// Checkpoint: save and load hash table + stacks
+// ---------------------------------------------------------------------------
+
+static bool save_checkpoint(const char* dir, AtomicHashSet& visited,
+                            ThreadWork* work, int num_threads,
+                            size_t warmup_states) {
+    std::string table_path = std::string(dir) + "/table.bin";
+    std::string stack_path = std::string(dir) + "/stacks.bin";
+
+    fprintf(stderr, "\n  Saving checkpoint to %s ...\n", dir);
+    auto t0 = time(nullptr);
+
+    // Save hash table
+    if (!visited.save(table_path.c_str())) return false;
+
+    // Save stacks + warmup_states count
+    FILE* f = fopen(stack_path.c_str(), "wb");
+    if (!f) { perror("save stacks"); return false; }
+    fwrite(&warmup_states, sizeof(size_t), 1, f);
+    fwrite(&num_threads, sizeof(int), 1, f);
+    for (int t = 0; t < num_threads; ++t) {
+        size_t sz = work[t].stack.size();
+        fwrite(&sz, sizeof(size_t), 1, f);
+        if (sz > 0)
+            fwrite(work[t].stack.data(), sizeof(CompactState), sz, f);
+    }
+    fclose(f);
+
+    double secs = difftime(time(nullptr), t0);
+    fprintf(stderr, "  Checkpoint saved (%.0fs)\n", secs);
+    return true;
+}
+
+static bool load_checkpoint(const char* dir, AtomicHashSet& visited,
+                            ThreadWork* work, int num_threads,
+                            size_t& warmup_states) {
+    std::string table_path = std::string(dir) + "/table.bin";
+    std::string stack_path = std::string(dir) + "/stacks.bin";
+
+    FILE* f = fopen(stack_path.c_str(), "rb");
+    if (!f) return false; // no checkpoint
+
+    fprintf(stderr, "Loading checkpoint from %s ...\n", dir);
+    auto t0 = time(nullptr);
+
+    // Load hash table
+    if (!visited.load_from(table_path.c_str())) { fclose(f); return false; }
+
+    // Load stacks
+    fread(&warmup_states, sizeof(size_t), 1, f);
+    int saved_threads;
+    fread(&saved_threads, sizeof(int), 1, f);
+
+    // Distribute loaded stacks across current threads
+    for (int t = 0; t < saved_threads; ++t) {
+        size_t sz;
+        fread(&sz, sizeof(size_t), 1, f);
+        if (sz > 0) {
+            int target = t % num_threads; // round-robin if thread count differs
+            size_t old_sz = work[target].stack.size();
+            work[target].stack.resize(old_sz + sz);
+            fread(&work[target].stack[old_sz], sizeof(CompactState), sz, f);
+        }
+    }
+    fclose(f);
+
+    double secs = difftime(time(nullptr), t0);
+    fprintf(stderr, "Checkpoint loaded (%.0fs)\n\n", secs);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
     size_t mem_gb = 100;
     int num_threads = (int)std::thread::hardware_concurrency();
     if (num_threads < 1) num_threads = 8;
+    const char* ckpt_dir = nullptr;
+    int ckpt_interval = 7200; // checkpoint every 2 hours (seconds)
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--mem-gb") == 0 && i + 1 < argc)
             mem_gb = (size_t)atol(argv[++i]);
         if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
             num_threads = atoi(argv[++i]);
+        if (strcmp(argv[i], "--checkpoint") == 0 && i + 1 < argc)
+            ckpt_dir = argv[++i];
+        if (strcmp(argv[i], "--ckpt-interval") == 0 && i + 1 < argc)
+            ckpt_interval = atoi(argv[++i]);
     }
 
     size_t table_bytes = mem_gb * (size_t)1024 * 1024 * 1024;
@@ -29,6 +115,8 @@ int main(int argc, char* argv[]) {
            mem_gb, table_cap / 1000000000, max_states / 1000000000);
     printf("Threads:     %d\n", num_threads);
     printf("Stack entry: %zu bytes\n", sizeof(CompactState));
+    if (ckpt_dir)
+        printf("Checkpoint:  %s (every %ds)\n", ckpt_dir, ckpt_interval);
     printf("\n");
 
     zobrist_init();
@@ -40,17 +128,33 @@ int main(int argc, char* argv[]) {
     g.num_threads = num_threads;
     g.max_states = 0; // unlimited
 
-    size_t warmup_target = (size_t)num_threads * 10000;
-    fprintf(stderr, "Warmup (target %zu stack entries)...\n", warmup_target);
-    size_t warmup_states = enum_warmup(visited, g, warmup_target);
-    fprintf(stderr, "Warmup: %zu states\n\n", warmup_states);
+    size_t warmup_states = 0;
+    bool resumed = false;
+
+    // Try loading checkpoint
+    if (ckpt_dir && load_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states)) {
+        resumed = true;
+        size_t loaded_stack = 0;
+        for (int t = 0; t < num_threads; ++t)
+            loaded_stack += g.work[t].stack.size();
+        fprintf(stderr, "Resumed: %zu warmup states, %zuM stack entries\n\n",
+                warmup_states, loaded_stack / 1000000);
+    }
+
+    if (!resumed) {
+        size_t warmup_target = (size_t)num_threads * 10000;
+        fprintf(stderr, "Warmup (target %zu stack entries)...\n", warmup_target);
+        warmup_states = enum_warmup(visited, g, warmup_target);
+        fprintf(stderr, "Warmup: %zu states\n\n", warmup_states);
+    }
 
     time_t t0 = time(nullptr);
+    time_t last_ckpt = t0;
 
     std::vector<ThreadStats> thread_stats(num_threads);
     std::vector<std::thread> threads;
 
-    // Reporter + convergence detector
+    // Reporter + convergence detector + checkpoint trigger
     std::thread report_thread([&]() {
         size_t prev_states = 0;
         size_t prev_stack = 0;
@@ -68,12 +172,9 @@ int main(int argc, char* argv[]) {
             double rate = elapsed > 0 ? s / elapsed : 0;
             size_t new_states = s - prev_states;
 
-            // Sample all thread stats (read-only, no contention)
             size_t total_stack = 0;
-            size_t total_pops = 0;
-            size_t total_pushes = 0;
-            size_t total_ins_true = 0;
-            size_t total_ins_false = 0;
+            size_t total_pops = 0, total_pushes = 0;
+            size_t total_ins_true = 0, total_ins_false = 0;
             int active_threads = 0;
             for (int i = 0; i < g.num_threads; ++i) {
                 size_t sz = g.work[i].stack.size();
@@ -95,7 +196,6 @@ int main(int argc, char* argv[]) {
             prev_pushes = total_pushes;
 
             if (new_states < 5000000) {
-                // Detailed view during drain/tail
                 fprintf(stderr,
                     "\r  St:%zu +%zu | Stk:%zuM(%+lldK) pop:%.1fK push:%.1fK | "
                     "ins:%.1fK dup:%.1fK | %dthr %.0fs     ",
@@ -104,7 +204,6 @@ int main(int argc, char* argv[]) {
                     ins_delta / 1e3, dup_delta / 1e3,
                     active_threads, elapsed);
             } else {
-                // Compact view during exploration
                 fprintf(stderr,
                     "\r  St: %12zu | +%zu/2s | Stk: %zuM (%+lldM/2s, %d thr) | "
                     "%.1fM/s | %.0fs     ",
@@ -114,10 +213,7 @@ int main(int argc, char* argv[]) {
             }
             fflush(stderr);
 
-            // Detect convergence: if zero new inserts for 15 consecutive
-            // checks (30 seconds), discovery is truly complete. Unlike the
-            // old drain mode, this lets work stealing continue so all
-            // reachable states are found before stopping.
+            // Convergence detection
             if (ins_delta == 0 && s > 1000000000) {
                 stall_count++;
                 if (stall_count >= 15) {
@@ -130,17 +226,54 @@ int main(int argc, char* argv[]) {
                 stall_count = 0;
             }
 
+            // Periodic checkpoint
+            if (ckpt_dir && difftime(time(nullptr), last_ckpt) >= ckpt_interval) {
+                // Stop workers briefly for consistent checkpoint
+                g.done.store(true, std::memory_order_relaxed);
+            }
+
             prev_ins_true = total_ins_true;
             prev_ins_false = total_ins_false;
             prev_states = s;
         }
     });
 
-    for (int t = 0; t < num_threads; ++t)
-        threads.emplace_back(enum_worker, std::ref(visited),
-                             std::ref(thread_stats[t]), t, std::ref(g));
+    // Main work loop — restarts workers after each checkpoint
+    bool converged = false;
+    while (!converged) {
+        g.done.store(false, std::memory_order_relaxed);
+        threads.clear();
 
-    for (auto& th : threads) th.join();
+        for (int t = 0; t < num_threads; ++t)
+            threads.emplace_back(enum_worker, std::ref(visited),
+                                 std::ref(thread_stats[t]), t, std::ref(g));
+
+        for (auto& th : threads) th.join();
+
+        // Check why we stopped
+        if (g.table_full.load(std::memory_order_relaxed)) {
+            converged = true; // table full
+        } else {
+            // Check if convergence (stall_count hit 15) or checkpoint trigger
+            // Count remaining stack to distinguish
+            size_t stack_total = 0;
+            for (int t = 0; t < num_threads; ++t)
+                stack_total += g.work[t].stack.size();
+
+            if (stack_total == 0) {
+                converged = true; // all stacks empty = truly done
+            } else if (ckpt_dir && difftime(time(nullptr), last_ckpt) >= ckpt_interval) {
+                // Checkpoint, then restart workers
+                save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states);
+                last_ckpt = time(nullptr);
+                fprintf(stderr, "  Resuming workers...\n\n");
+                // Loop continues — workers will restart
+            } else {
+                converged = true; // convergence detected
+            }
+        }
+    }
+
     g.done.store(true, std::memory_order_relaxed);
     report_thread.join();
 
@@ -166,7 +299,7 @@ int main(int argc, char* argv[]) {
     for (int t = 0; t < num_threads; ++t)
         remaining_stack += g.work[t].stack.size();
 
-    // Verify sample: check that unprocessed states' successors are all known
+    // Verify sample
     size_t verify_missed = 0;
     if (remaining_stack > 0) {
         size_t sample_limit = std::min((size_t)1000000, remaining_stack);
@@ -195,6 +328,10 @@ int main(int argc, char* argv[]) {
         else
             fprintf(stderr, "  WARNING: %zu new states found in verification!\n", verify_missed);
     }
+
+    // Final checkpoint
+    if (ckpt_dir)
+        save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states);
 
     bool complete = !g.table_full.load() && verify_missed == 0;
     double elapsed = difftime(time(nullptr), t0);

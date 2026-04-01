@@ -119,6 +119,30 @@ public:
     size_t memory_bytes() const { return capacity_ * sizeof(uint32_t); }
     double load()         const { return (double)count() / capacity_; }
 
+    // Checkpoint: save raw table to file
+    bool save(const char* path) const {
+        FILE* f = fopen(path, "wb");
+        if (!f) { perror("checkpoint save"); return false; }
+        size_t bytes = capacity_ * sizeof(uint32_t);
+        size_t written = fwrite((const void*)table_, 1, bytes, f);
+        fclose(f);
+        if (written != bytes) { fprintf(stderr, "checkpoint: short write\n"); return false; }
+        return true;
+    }
+
+    // Checkpoint: load raw table from file (must match capacity)
+    bool load_from(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) return false; // no checkpoint = fresh start
+        size_t bytes = capacity_ * sizeof(uint32_t);
+        size_t rd = fread((void*)table_, 1, bytes, f);
+        fclose(f);
+        if (rd != bytes) { fprintf(stderr, "checkpoint: short read\n"); return false; }
+        return true;
+    }
+
+    std::atomic<uint32_t>* raw_table() { return table_; }
+
 private:
     std::atomic<uint32_t>* table_;
     size_t capacity_;
