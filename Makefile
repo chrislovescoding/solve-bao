@@ -13,6 +13,7 @@ BENCH_PAR_SRC = tests/benchmark_parallel.cpp
 BENCH_SOLVER_SRC = tests/benchmark_solver.cpp
 
 .PHONY: all test enumerate enumerate_par solver bench bench_par bench_solver bench_move clean
+.PHONY: enumerate_gpu bench_gpu
 
 all: test enumerate enumerate_par solver
 
@@ -58,6 +59,20 @@ build/benchmark_solver: $(BENCH_SOLVER_SRC) $(SRC) $(HDR) src/solver_core.h | bu
 
 build/benchmark_make_move: tests/benchmark_make_move.cpp $(SRC) $(HDR) | build
 	$(CXX) $(CXXFLAGS_FAST) -funroll-loops -o $@ tests/benchmark_make_move.cpp $(SRC)
+
+# GPU targets (require nvcc + CUDA)
+NVCC = nvcc
+NVCC_FLAGS = -std=c++17 -O3 -Xcompiler "-O3 -Wall -funroll-loops" --use_fast_math
+
+enumerate_gpu: build/enumerate_gpu
+bench_gpu: build/benchmark_gpu
+	./build/benchmark_gpu
+
+build/enumerate_gpu: src/enumerate_gpu.cu src/bao_gpu.cuh src/enumerate_core.h $(SRC) $(HDR) | build
+	$(NVCC) $(NVCC_FLAGS) -o $@ src/enumerate_gpu.cu $(SRC) -lpthread
+
+build/benchmark_gpu: tests/benchmark_gpu.cu src/bao_gpu.cuh $(SRC) $(HDR) | build
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/benchmark_gpu.cu $(SRC)
 
 build:
 	mkdir -p build
