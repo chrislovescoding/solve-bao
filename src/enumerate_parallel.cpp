@@ -131,6 +131,9 @@ int main(int argc, char* argv[]) {
     size_t warmup_states = 0;
     bool resumed = false;
 
+    // Allocate thread work BEFORE checkpoint load (enum_warmup normally does this)
+    g.work = new ThreadWork[num_threads];
+
     // Try loading checkpoint
     if (ckpt_dir && load_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states)) {
         resumed = true;

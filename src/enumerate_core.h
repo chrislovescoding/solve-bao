@@ -422,7 +422,7 @@ static size_t enum_warmup(AtomicHashSet& visited, EnumGlobals& g,
     }
 
     // Distribute to thread stacks
-    g.work = new ThreadWork[g.num_threads];
+    if (!g.work) g.work = new ThreadWork[g.num_threads];
     for (size_t i = 0; i < warmup_stack.size(); ++i)
         g.work[i % g.num_threads].stack.push_back(warmup_stack[i]);
 
