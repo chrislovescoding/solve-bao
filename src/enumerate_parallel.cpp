@@ -165,9 +165,9 @@ int main(int argc, char* argv[]) {
     std::vector<std::thread> threads;
 
     // Main work loop with inline reporting, convergence detection, and checkpointing
-    // (Single loop avoids the reporter-thread-dies-after-checkpoint bug)
     bool converged = false;
-    size_t prev_states = 0, prev_stack = 0;
+    size_t prev_states = g.states.load(std::memory_order_relaxed);
+    size_t prev_stack = 0;
     size_t prev_pops = 0, prev_pushes = 0;
     size_t prev_ins_true = 0, prev_ins_false = 0;
     int stall_count = 0;
@@ -251,10 +251,22 @@ int main(int argc, char* argv[]) {
             for (auto& th : threads) th.join();
             threads.clear();
 
+            // Flush unflushed state counts before saving
+            for (int t = 0; t < num_threads; ++t) {
+                size_t unflushed = thread_stats[t].states & 0x3FF;
+                if (unflushed > 0)
+                    g.states.fetch_add(unflushed, std::memory_order_relaxed);
+            }
+
             save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states,
                             g.states.load(std::memory_order_relaxed));
             last_ckpt = time(nullptr);
             fprintf(stderr, "  Resuming workers...\n\n");
+
+            // Reset prev counters (thread_stats reset to 0 on worker restart)
+            prev_states = g.states.load(std::memory_order_relaxed);
+            prev_pops = prev_pushes = prev_ins_true = prev_ins_false = 0;
+            stall_count = 0;
 
             g.done.store(false, std::memory_order_relaxed);
             for (int t = 0; t < num_threads; ++t)
@@ -271,14 +283,16 @@ int main(int argc, char* argv[]) {
     g.done.store(true, std::memory_order_relaxed);
     for (auto& th : threads) th.join();
 
-    // Aggregate: restored states + new states found in this session
-    size_t total_states = resumed ? restored_states : warmup_states;
+    // Aggregate: g.states has cumulative count across all checkpoint cycles
+    // (batched in 1024s). Add the un-flushed tail from current cycle.
+    size_t total_states = g.states.load(std::memory_order_relaxed);
+    for (int t = 0; t < num_threads; ++t)
+        total_states += thread_stats[t].states & 0x3FF; // un-flushed remainder
     size_t total_terminal = 0, total_moves = 0;
     size_t total_infinite = 0, total_inner = 0;
     size_t peak_stack = 0, total_steals = 0;
 
     for (int t = 0; t < num_threads; ++t) {
-        total_states   += thread_stats[t].states;
         total_terminal += thread_stats[t].terminal;
         total_moves    += thread_stats[t].moves;
         total_infinite += thread_stats[t].infinite;
