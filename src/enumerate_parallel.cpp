@@ -9,6 +9,7 @@
 
 #include "enumerate_core.h"
 #include <ctime>
+#include <cmath>
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -172,6 +173,12 @@ int main(int argc, char* argv[]) {
     size_t prev_ins_true = 0, prev_ins_false = 0;
     int stall_count = 0;
 
+    // ETA tracking: rate from 60 seconds ago vs now
+    static const int ETA_WINDOW = 30; // ticks (60 seconds at 2s/tick)
+    size_t rate_history[ETA_WINDOW] = {};
+    int rate_idx = 0;
+    bool rate_filled = false;
+
     g.done.store(false, std::memory_order_relaxed);
     threads.clear();
     for (int t = 0; t < num_threads; ++t)
@@ -209,13 +216,32 @@ int main(int argc, char* argv[]) {
         prev_pops = total_pops;
         prev_pushes = total_pushes;
 
+        // Push/pop ratio and ETA
+        double pp_ratio = pop_delta > 0 ? (double)push_delta / pop_delta : 0.0;
+
+        // Rolling ETA: compare current rate to rate ETA_WINDOW ticks ago
+        size_t old_rate = rate_history[rate_idx];
+        rate_history[rate_idx] = ins_delta;
+        rate_idx = (rate_idx + 1) % ETA_WINDOW;
+        if (!rate_filled && rate_idx == 0) rate_filled = true;
+
+        char eta_buf[32] = "???";
+        if (rate_filled && old_rate > ins_delta && ins_delta > 0) {
+            // τ = window_seconds / ln(old_rate / current_rate)
+            double window_sec = ETA_WINDOW * 2.0;
+            double tau = window_sec / log((double)old_rate / ins_delta);
+            double eta_sec = tau * log((double)ins_delta * 2.0);  // time to rate < 0.5/sec
+            if (eta_sec > 0 && eta_sec < 1e7)
+                snprintf(eta_buf, sizeof(eta_buf), "%.1fh", eta_sec / 3600.0);
+        }
+
         if (new_states < 5000000) {
             fprintf(stderr,
-                "\r  St:%zu +%zu | Stk:%zuM(%+lldK) pop:%.1fK push:%.1fK | "
-                "ins:%.1fK dup:%.1fK | %dthr %.0fs     ",
+                "\r  St:%zu +%zu | Stk:%zuM(%+lldK) r:%.2f | "
+                "ins:%.1fK | ETA:%s | %dthr %.0fs     ",
                 s, new_states, total_stack / 1000000,
-                stack_delta / 1000, pop_delta / 1e3, push_delta / 1e3,
-                ins_delta / 1e3, dup_delta / 1e3,
+                stack_delta / 1000, pp_ratio,
+                ins_delta / 1e3, eta_buf,
                 active_threads, elapsed);
         } else {
             fprintf(stderr,
