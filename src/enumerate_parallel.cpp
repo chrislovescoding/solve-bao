@@ -173,11 +173,13 @@ int main(int argc, char* argv[]) {
     size_t prev_ins_true = 0, prev_ins_false = 0;
     int stall_count = 0;
 
-    // ETA tracking: rate from 60 seconds ago vs now
-    static const int ETA_WINDOW = 30; // ticks (60 seconds at 2s/tick)
-    size_t rate_history[ETA_WINDOW] = {};
-    int rate_idx = 0;
-    bool rate_filled = false;
+    // ETA tracking: compare 5-min-average rates at two intervals
+    // Stores total_ins_true snapshots every 5 minutes
+    size_t eta_snap_cur = 0, eta_snap_prev = 0;
+    time_t eta_time_cur = t0, eta_time_prev = t0;
+    int eta_tick = 0;
+    bool eta_has_two = false;  // need two 5-min windows for τ estimate
+    double last_tau = 0;       // smoothed τ estimate
 
     g.done.store(false, std::memory_order_relaxed);
     threads.clear();
@@ -216,23 +218,37 @@ int main(int argc, char* argv[]) {
         prev_pops = total_pops;
         prev_pushes = total_pushes;
 
-        // Push/pop ratio and ETA
+        // Push/pop ratio
         double pp_ratio = pop_delta > 0 ? (double)push_delta / pop_delta : 0.0;
 
-        // Rolling ETA: compare current rate to rate ETA_WINDOW ticks ago
-        size_t old_rate = rate_history[rate_idx];
-        rate_history[rate_idx] = ins_delta;
-        rate_idx = (rate_idx + 1) % ETA_WINDOW;
-        if (!rate_filled && rate_idx == 0) rate_filled = true;
+        // ETA: snapshot total_ins_true every 5 minutes, compare two windows
+        eta_tick++;
+        if (eta_tick % 150 == 0) {  // every 300 seconds (150 ticks × 2s)
+            eta_snap_prev = eta_snap_cur;
+            eta_time_prev = eta_time_cur;
+            eta_snap_cur = total_ins_true;
+            eta_time_cur = time(nullptr);
+            if (eta_tick >= 300) eta_has_two = true;  // need two full windows
+        }
 
-        char eta_buf[32] = "???";
-        if (rate_filled && old_rate > ins_delta && ins_delta > 0) {
-            // τ = window_seconds / ln(old_rate / current_rate)
-            double window_sec = ETA_WINDOW * 2.0;
-            double tau = window_sec / log((double)old_rate / ins_delta);
-            double eta_sec = tau * log((double)ins_delta * 2.0);  // time to rate < 0.5/sec
-            if (eta_sec > 0 && eta_sec < 1e7)
-                snprintf(eta_buf, sizeof(eta_buf), "%.1fh", eta_sec / 3600.0);
+        char eta_buf[32] = "---";
+        if (eta_has_two) {
+            double dt = difftime(eta_time_cur, eta_time_prev);
+            double recent_rate = (total_ins_true - eta_snap_cur) /
+                                 fmax(difftime(time(nullptr), eta_time_cur), 1.0);
+            double older_rate  = (double)(eta_snap_cur - eta_snap_prev) / fmax(dt, 1.0);
+
+            if (older_rate > recent_rate && recent_rate > 0.5) {
+                double tau = dt / log(older_rate / recent_rate);
+                if (last_tau > 0)
+                    tau = 0.3 * tau + 0.7 * last_tau;  // smooth τ
+                last_tau = tau;
+                double eta_sec = tau * log(recent_rate / 0.5);
+                if (eta_sec > 0 && eta_sec < 1e7)
+                    snprintf(eta_buf, sizeof(eta_buf), "%.1fh", eta_sec / 3600.0);
+            } else if (recent_rate <= 0.5) {
+                snprintf(eta_buf, sizeof(eta_buf), "<1min");
+            }
         }
 
         if (new_states < 5000000) {
