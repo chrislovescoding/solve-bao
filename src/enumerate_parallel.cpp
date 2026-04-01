@@ -154,128 +154,111 @@ int main(int argc, char* argv[]) {
     std::vector<ThreadStats> thread_stats(num_threads);
     std::vector<std::thread> threads;
 
-    // Reporter + convergence detector + checkpoint trigger
-    std::thread report_thread([&]() {
-        size_t prev_states = 0;
-        size_t prev_stack = 0;
-        size_t prev_pops = 0;
-        size_t prev_pushes = 0;
-        size_t prev_ins_true = 0;
-        size_t prev_ins_false = 0;
-        int stall_count = 0;
-        while (!g.done.load(std::memory_order_relaxed) &&
-               !g.table_full.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            size_t s = g.states.load(std::memory_order_relaxed);
-            size_t t = g.terminal.load(std::memory_order_relaxed);
-            double elapsed = difftime(time(nullptr), t0);
-            double rate = elapsed > 0 ? s / elapsed : 0;
-            size_t new_states = s - prev_states;
-
-            size_t total_stack = 0;
-            size_t total_pops = 0, total_pushes = 0;
-            size_t total_ins_true = 0, total_ins_false = 0;
-            int active_threads = 0;
-            for (int i = 0; i < g.num_threads; ++i) {
-                size_t sz = g.work[i].stack.size();
-                total_stack += sz;
-                total_pops += thread_stats[i].pops;
-                total_pushes += thread_stats[i].pushes;
-                total_ins_true += thread_stats[i].insert_true;
-                total_ins_false += thread_stats[i].insert_false;
-                if (sz > 0) active_threads++;
-            }
-
-            long long stack_delta = (long long)total_stack - (long long)prev_stack;
-            size_t pop_delta = total_pops - prev_pops;
-            size_t push_delta = total_pushes - prev_pushes;
-            size_t ins_delta = total_ins_true - prev_ins_true;
-            size_t dup_delta = total_ins_false - prev_ins_false;
-            prev_stack = total_stack;
-            prev_pops = total_pops;
-            prev_pushes = total_pushes;
-
-            if (new_states < 5000000) {
-                fprintf(stderr,
-                    "\r  St:%zu +%zu | Stk:%zuM(%+lldK) pop:%.1fK push:%.1fK | "
-                    "ins:%.1fK dup:%.1fK | %dthr %.0fs     ",
-                    s, new_states, total_stack / 1000000,
-                    stack_delta / 1000, pop_delta / 1e3, push_delta / 1e3,
-                    ins_delta / 1e3, dup_delta / 1e3,
-                    active_threads, elapsed);
-            } else {
-                fprintf(stderr,
-                    "\r  St: %12zu | +%zu/2s | Stk: %zuM (%+lldM/2s, %d thr) | "
-                    "%.1fM/s | %.0fs     ",
-                    s, new_states, total_stack / 1000000,
-                    stack_delta / 1000000, active_threads,
-                    rate / 1e6, elapsed);
-            }
-            fflush(stderr);
-
-            // Convergence detection
-            if (ins_delta == 0 && s > 1000000000) {
-                stall_count++;
-                if (stall_count >= 15) {
-                    g.done.store(true, std::memory_order_relaxed);
-                    fprintf(stderr,
-                        "\n\n  >>> Discovery converged (0 new inserts for 30s). "
-                        "Stopping. <<<\n");
-                }
-            } else {
-                stall_count = 0;
-            }
-
-            // Periodic checkpoint
-            if (ckpt_dir && difftime(time(nullptr), last_ckpt) >= ckpt_interval) {
-                // Stop workers briefly for consistent checkpoint
-                g.done.store(true, std::memory_order_relaxed);
-            }
-
-            prev_ins_true = total_ins_true;
-            prev_ins_false = total_ins_false;
-            prev_states = s;
-        }
-    });
-
-    // Main work loop — restarts workers after each checkpoint
+    // Main work loop with inline reporting, convergence detection, and checkpointing
+    // (Single loop avoids the reporter-thread-dies-after-checkpoint bug)
     bool converged = false;
+    size_t prev_states = 0, prev_stack = 0;
+    size_t prev_pops = 0, prev_pushes = 0;
+    size_t prev_ins_true = 0, prev_ins_false = 0;
+    int stall_count = 0;
+
+    g.done.store(false, std::memory_order_relaxed);
+    threads.clear();
+    for (int t = 0; t < num_threads; ++t)
+        threads.emplace_back(enum_worker, std::ref(visited),
+                             std::ref(thread_stats[t]), t, std::ref(g));
+
     while (!converged) {
-        g.done.store(false, std::memory_order_relaxed);
-        threads.clear();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
 
-        for (int t = 0; t < num_threads; ++t)
-            threads.emplace_back(enum_worker, std::ref(visited),
-                                 std::ref(thread_stats[t]), t, std::ref(g));
+        size_t s = g.states.load(std::memory_order_relaxed);
+        double elapsed = difftime(time(nullptr), t0);
+        double rate = elapsed > 0 ? s / elapsed : 0;
+        size_t new_states = s - prev_states;
 
-        for (auto& th : threads) th.join();
-
-        // Check why we stopped
-        if (g.table_full.load(std::memory_order_relaxed)) {
-            converged = true; // table full
-        } else {
-            // Check if convergence (stall_count hit 15) or checkpoint trigger
-            // Count remaining stack to distinguish
-            size_t stack_total = 0;
-            for (int t = 0; t < num_threads; ++t)
-                stack_total += g.work[t].stack.size();
-
-            if (stack_total == 0) {
-                converged = true; // all stacks empty = truly done
-            } else if (ckpt_dir && difftime(time(nullptr), last_ckpt) >= ckpt_interval) {
-                // Checkpoint, then restart workers
-                save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states);
-                last_ckpt = time(nullptr);
-                fprintf(stderr, "  Resuming workers...\n\n");
-                // Loop continues — workers will restart
-            } else {
-                converged = true; // convergence detected
-            }
+        size_t total_stack = 0;
+        size_t total_pops = 0, total_pushes = 0;
+        size_t total_ins_true = 0, total_ins_false = 0;
+        int active_threads = 0;
+        for (int i = 0; i < g.num_threads; ++i) {
+            size_t sz = g.work[i].stack.size();
+            total_stack += sz;
+            total_pops += thread_stats[i].pops;
+            total_pushes += thread_stats[i].pushes;
+            total_ins_true += thread_stats[i].insert_true;
+            total_ins_false += thread_stats[i].insert_false;
+            if (sz > 0) active_threads++;
         }
+
+        long long stack_delta = (long long)total_stack - (long long)prev_stack;
+        size_t pop_delta = total_pops - prev_pops;
+        size_t push_delta = total_pushes - prev_pushes;
+        size_t ins_delta = total_ins_true - prev_ins_true;
+        size_t dup_delta = total_ins_false - prev_ins_false;
+        prev_stack = total_stack;
+        prev_pops = total_pops;
+        prev_pushes = total_pushes;
+
+        if (new_states < 5000000) {
+            fprintf(stderr,
+                "\r  St:%zu +%zu | Stk:%zuM(%+lldK) pop:%.1fK push:%.1fK | "
+                "ins:%.1fK dup:%.1fK | %dthr %.0fs     ",
+                s, new_states, total_stack / 1000000,
+                stack_delta / 1000, pop_delta / 1e3, push_delta / 1e3,
+                ins_delta / 1e3, dup_delta / 1e3,
+                active_threads, elapsed);
+        } else {
+            fprintf(stderr,
+                "\r  St: %12zu | +%zu/2s | Stk: %zuM (%+lldM/2s, %d thr) | "
+                "%.1fM/s | %.0fs     ",
+                s, new_states, total_stack / 1000000,
+                stack_delta / 1000000, active_threads,
+                rate / 1e6, elapsed);
+        }
+        fflush(stderr);
+
+        // Convergence detection
+        if (ins_delta == 0 && s > 1000000000) {
+            stall_count++;
+            if (stall_count >= 15) {
+                fprintf(stderr,
+                    "\n\n  >>> Discovery converged (0 new inserts for 30s). "
+                    "Stopping. <<<\n");
+                converged = true;
+            }
+        } else {
+            stall_count = 0;
+        }
+
+        // Table full
+        if (g.table_full.load(std::memory_order_relaxed))
+            converged = true;
+
+        // Periodic checkpoint: stop workers, save, restart
+        if (!converged && ckpt_dir &&
+            difftime(time(nullptr), last_ckpt) >= ckpt_interval) {
+            g.done.store(true, std::memory_order_relaxed);
+            for (auto& th : threads) th.join();
+            threads.clear();
+
+            save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states);
+            last_ckpt = time(nullptr);
+            fprintf(stderr, "  Resuming workers...\n\n");
+
+            g.done.store(false, std::memory_order_relaxed);
+            for (int t = 0; t < num_threads; ++t)
+                threads.emplace_back(enum_worker, std::ref(visited),
+                                     std::ref(thread_stats[t]), t, std::ref(g));
+        }
+
+        prev_ins_true = total_ins_true;
+        prev_ins_false = total_ins_false;
+        prev_states = s;
     }
 
+    // Stop workers
     g.done.store(true, std::memory_order_relaxed);
-    report_thread.join();
+    for (auto& th : threads) th.join();
 
     // Aggregate from thread-local stats (exact)
     size_t total_states = warmup_states;
