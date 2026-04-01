@@ -17,7 +17,7 @@
 
 static bool save_checkpoint(const char* dir, AtomicHashSet& visited,
                             ThreadWork* work, int num_threads,
-                            size_t warmup_states) {
+                            size_t warmup_states, size_t g_states_snapshot) {
     std::string table_path = std::string(dir) + "/table.bin";
     std::string stack_path = std::string(dir) + "/stacks.bin";
 
@@ -27,10 +27,13 @@ static bool save_checkpoint(const char* dir, AtomicHashSet& visited,
     // Save hash table
     if (!visited.save(table_path.c_str())) return false;
 
-    // Save stacks + warmup_states count
+    // Save stacks + counters
     FILE* f = fopen(stack_path.c_str(), "wb");
     if (!f) { perror("save stacks"); return false; }
     fwrite(&warmup_states, sizeof(size_t), 1, f);
+    // Save current total state count so we can restore g.states on load
+    size_t total_so_far = g_states_snapshot;
+    fwrite(&total_so_far, sizeof(size_t), 1, f);
     fwrite(&num_threads, sizeof(int), 1, f);
     for (int t = 0; t < num_threads; ++t) {
         size_t sz = work[t].stack.size();
@@ -47,7 +50,7 @@ static bool save_checkpoint(const char* dir, AtomicHashSet& visited,
 
 static bool load_checkpoint(const char* dir, AtomicHashSet& visited,
                             ThreadWork* work, int num_threads,
-                            size_t& warmup_states) {
+                            size_t& warmup_states, size_t& restored_states) {
     std::string table_path = std::string(dir) + "/table.bin";
     std::string stack_path = std::string(dir) + "/stacks.bin";
 
@@ -60,8 +63,9 @@ static bool load_checkpoint(const char* dir, AtomicHashSet& visited,
     // Load hash table
     if (!visited.load_from(table_path.c_str())) { fclose(f); return false; }
 
-    // Load stacks
+    // Load counters
     fread(&warmup_states, sizeof(size_t), 1, f);
+    fread(&restored_states, sizeof(size_t), 1, f);
     int saved_threads;
     fread(&saved_threads, sizeof(int), 1, f);
 
@@ -135,13 +139,16 @@ int main(int argc, char* argv[]) {
     g.work = new ThreadWork[num_threads];
 
     // Try loading checkpoint
-    if (ckpt_dir && load_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states)) {
+    size_t restored_states = 0;
+    if (ckpt_dir && load_checkpoint(ckpt_dir, visited, g.work, num_threads,
+                                     warmup_states, restored_states)) {
         resumed = true;
+        g.states.store(restored_states, std::memory_order_relaxed);
         size_t loaded_stack = 0;
         for (int t = 0; t < num_threads; ++t)
             loaded_stack += g.work[t].stack.size();
-        fprintf(stderr, "Resumed: %zu warmup states, %zuM stack entries\n\n",
-                warmup_states, loaded_stack / 1000000);
+        fprintf(stderr, "Resumed: %zu states, %zuM stack entries\n\n",
+                restored_states, loaded_stack / 1000000);
     }
 
     if (!resumed) {
@@ -244,7 +251,8 @@ int main(int argc, char* argv[]) {
             for (auto& th : threads) th.join();
             threads.clear();
 
-            save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states);
+            save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states,
+                            g.states.load(std::memory_order_relaxed));
             last_ckpt = time(nullptr);
             fprintf(stderr, "  Resuming workers...\n\n");
 
@@ -263,8 +271,8 @@ int main(int argc, char* argv[]) {
     g.done.store(true, std::memory_order_relaxed);
     for (auto& th : threads) th.join();
 
-    // Aggregate from thread-local stats (exact)
-    size_t total_states = warmup_states;
+    // Aggregate: restored states + new states found in this session
+    size_t total_states = resumed ? restored_states : warmup_states;
     size_t total_terminal = 0, total_moves = 0;
     size_t total_infinite = 0, total_inner = 0;
     size_t peak_stack = 0, total_steals = 0;
@@ -317,7 +325,8 @@ int main(int argc, char* argv[]) {
 
     // Final checkpoint
     if (ckpt_dir)
-        save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states);
+        save_checkpoint(ckpt_dir, visited, g.work, num_threads, warmup_states,
+                            g.states.load(std::memory_order_relaxed));
 
     bool complete = !g.table_full.load() && verify_missed == 0;
     double elapsed = difftime(time(nullptr), t0);
