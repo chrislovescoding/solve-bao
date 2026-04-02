@@ -1,6 +1,6 @@
 #pragma once
 /*
- * bao.h — Bao la Kujifunza game engine (v2 — optimized)
+ * bao.h - Bao la Kujifunza game engine (v2 - optimized)
  *
  * State representation:
  *   pits[0..15]  = side to move (loop order: inner i1-i8 then outer o8-o1)
@@ -21,13 +21,14 @@
  *   - sow() is bare metal: just pits[idx]++. No hash, no bitmask.
  *   - Hash computed once after move completes (32 lookups, always).
  *   - Bitmasks computed on demand in generate_moves().
- *   - inner_empty() uses uint64 load — one compare, no bitmask.
+ *   - inner_empty() uses uint64 load - one compare, no bitmask.
  *   - Hot functions defined inline for guaranteed inlining.
  */
 
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
+#include "bao_profile.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,7 +52,7 @@ static constexpr int REFLECT[16] = {
 };
 
 // ---------------------------------------------------------------------------
-// Sow lookup tables — precomputed SIMD masks for small-count sowing
+// Sow lookup tables - precomputed SIMD masks for small-count sowing
 // ---------------------------------------------------------------------------
 
 // Precomputed sow data: for each (dir, start, count) store 16-byte increment mask + landing
@@ -109,7 +110,7 @@ struct BaoState {
     uint8_t*       side(int s)       { return &pits[s * PITS_PER_SIDE]; }
     const uint8_t* side(int s) const { return &pits[s * PITS_PER_SIDE]; }
 
-    // ---- Inner row empty check (uint64 trick — one load, one compare) ----
+    // ---- Inner row empty check (uint64 trick - one load, one compare) ----
     inline bool inner_empty(int s) const {
         uint64_t v;
         memcpy(&v, &pits[s * PITS_PER_SIDE], 8);
@@ -141,7 +142,7 @@ struct BaoState {
     // in a single pass. Applies reflection only if needed.
     uint64_t canonicalize_and_hash();
 
-    // Compute canonical hash WITHOUT modifying state. For enumeration only —
+    // Compute canonical hash WITHOUT modifying state. For enumeration only -
     // the state stays in its original (possibly non-canonical) orientation.
     // Both orientations generate the same set of canonical successor hashes,
     // so this is safe for counting reachable states.
@@ -254,10 +255,13 @@ struct BaoState {
         return sow_fast(start_idx, count, dir_idx);
     }
 
-    // ---- Sow fast path (inline) — dir_idx precomputed by caller ----
+    // ---- Sow fast path (inline) - dir_idx precomputed by caller ----
     // dir_idx: 0=CW, 1=ACW
     __attribute__((hot)) inline int sow_fast(int start_idx, int count, int dir_idx) {
         uint8_t* __restrict__ p = &pits[0];
+#ifdef BAO_ENABLE_MOVE_PROFILE
+        bao_profile_record_sow(count);
+#endif
 
         if (count < PITS_PER_SIDE) {
             const SowEntry& e = SOW_TABLE[dir_idx][start_idx][count];
@@ -287,27 +291,56 @@ struct BaoState {
         int step = dir_idx == 0 ? 1 : 15; // precomputed for sow_start update
         int sow_start = m.pit;
         int total_sown = 0;
+#ifdef BAO_ENABLE_MOVE_PROFILE
+        uint64_t profile_sow_calls = 0;
+        uint64_t profile_capture_resows = 0;
+        uint64_t profile_relay_resows = 0;
+#endif
 
         int seeds = pits[sow_start];
         pits[sow_start] = 0;
 
         for (;;) {
+#ifdef BAO_ENABLE_MOVE_PROFILE
+            profile_sow_calls++;
+#endif
             int landing = sow_fast(sow_start, seeds, dir_idx);
             total_sown += seeds;
 
-            if (__builtin_expect(total_sown > MAX_SOW_THRESHOLD, 0))
+            if (__builtin_expect(total_sown > MAX_SOW_THRESHOLD, 0)) {
+#ifdef BAO_ENABLE_MOVE_PROFILE
+                bao_profile_finish_move(false, true, false,
+                                        profile_sow_calls, total_sown,
+                                        profile_capture_resows,
+                                        profile_relay_resows);
+#endif
                 return MoveResult::INFINITE;
+            }
 
             uint8_t landing_count = pits[landing];
 
             if (__builtin_expect(landing_count == 1, 0)) {
-                if (__builtin_expect(inner_empty(0), 0))
+                if (__builtin_expect(inner_empty(0), 0)) {
+#ifdef BAO_ENABLE_MOVE_PROFILE
+                    bao_profile_finish_move(false, false, true,
+                                            profile_sow_calls, total_sown,
+                                            profile_capture_resows,
+                                            profile_relay_resows);
+#endif
                     return MoveResult::INNER_ROW_EMPTY;
+                }
                 break;
             }
 
-            if (__builtin_expect(inner_empty(0), 0))
+            if (__builtin_expect(inner_empty(0), 0)) {
+#ifdef BAO_ENABLE_MOVE_PROFILE
+                bao_profile_finish_move(false, false, true,
+                                        profile_sow_calls, total_sown,
+                                        profile_capture_resows,
+                                        profile_relay_resows);
+#endif
                 return MoveResult::INNER_ROW_EMPTY;
+            }
 
             if constexpr (IS_CAPTURING) {
                 if (landing < INNER_PITS) {
@@ -328,6 +361,9 @@ struct BaoState {
                         } else {
                             sow_start = (dir_idx == 0) ? KICHWA_L : KICHWA_R;
                         }
+#ifdef BAO_ENABLE_MOVE_PROFILE
+                        profile_capture_resows++;
+#endif
                         continue;
                     }
                 }
@@ -336,9 +372,18 @@ struct BaoState {
             seeds = landing_count;
             pits[landing] = 0;
             sow_start = (landing + step) & 15;
+#ifdef BAO_ENABLE_MOVE_PROFILE
+            profile_relay_resows++;
+#endif
         }
 
         swap_sides();
+#ifdef BAO_ENABLE_MOVE_PROFILE
+        bao_profile_finish_move(true, false, false,
+                                profile_sow_calls, total_sown,
+                                profile_capture_resows,
+                                profile_relay_resows);
+#endif
         return MoveResult::OK;
     }
 
@@ -372,3 +417,4 @@ struct BaoState {
         return pits[PITS_PER_SIDE + landing] > 0;
     }
 };
+

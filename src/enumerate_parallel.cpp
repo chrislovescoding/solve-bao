@@ -1,5 +1,5 @@
 /*
- * enumerate_parallel.cpp — Production parallel enumerator with checkpointing
+ * enumerate_parallel.cpp - Production parallel enumerator with checkpointing
  *
  * Supports spot/preemptible VMs: saves hash table + stacks to disk
  * periodically. On restart, loads the checkpoint and continues.
@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
     size_t table_cap   = table_bytes / sizeof(uint32_t);
     size_t max_states  = (size_t)(table_cap * 0.70);
 
-    printf("Bao la Kujifunza — Parallel State Enumerator\n");
+    printf("Bao la Kujifunza - Parallel State Enumerator\n");
     printf("=============================================\n");
     printf("Hash table:  %zu GB, 4 bytes/slot, %zuB slots, ~%zuB max states\n",
            mem_gb, table_cap / 1000000000, max_states / 1000000000);
@@ -178,8 +178,8 @@ int main(int argc, char* argv[]) {
     size_t eta_snap_cur = 0, eta_snap_prev = 0;
     time_t eta_time_cur = t0, eta_time_prev = t0;
     int eta_tick = 0;
-    bool eta_has_two = false;  // need two 5-min windows for τ estimate
-    double last_tau = 0;       // smoothed τ estimate
+    bool eta_has_two = false;  // need two 5-min windows for tau estimate
+    double last_tau = 0;       // smoothed tau estimate
 
     g.done.store(false, std::memory_order_relaxed);
     threads.clear();
@@ -220,10 +220,24 @@ int main(int argc, char* argv[]) {
 
         // Push/pop ratio
         double pp_ratio = pop_delta > 0 ? (double)push_delta / pop_delta : 0.0;
+        double pop_rate = pop_delta / 2.0;
+        double ins_rate = ins_delta / 2.0;
+        double dup_rate = dup_delta / 2.0;
+        double drain_rate = stack_delta < 0 ? (-stack_delta / 2.0) : 0.0;
+        char drain_buf[32] = "---";
+        if (drain_rate > 0.5) {
+            double eta_sec = total_stack / drain_rate;
+            if (eta_sec < 120.0)
+                snprintf(drain_buf, sizeof(drain_buf), "%.0fs", eta_sec);
+            else if (eta_sec < 7200.0)
+                snprintf(drain_buf, sizeof(drain_buf), "%.1fm", eta_sec / 60.0);
+            else
+                snprintf(drain_buf, sizeof(drain_buf), "%.1fh", eta_sec / 3600.0);
+        }
 
         // ETA: snapshot total_ins_true every 5 minutes, compare two windows
         eta_tick++;
-        if (eta_tick % 150 == 0) {  // every 300 seconds (150 ticks × 2s)
+        if (eta_tick % 150 == 0) {  // every 300 seconds (150 ticks x 2s)
             eta_snap_prev = eta_snap_cur;
             eta_time_prev = eta_time_cur;
             eta_snap_cur = total_ins_true;
@@ -241,7 +255,7 @@ int main(int argc, char* argv[]) {
             if (older_rate > recent_rate && recent_rate > 0.5) {
                 double tau = dt / log(older_rate / recent_rate);
                 if (last_tau > 0)
-                    tau = 0.3 * tau + 0.7 * last_tau;  // smooth τ
+                    tau = 0.3 * tau + 0.7 * last_tau;  // smooth tau
                 last_tau = tau;
                 double eta_sec = tau * log(recent_rate / 0.5);
                 if (eta_sec > 0 && eta_sec < 1e7)
@@ -254,10 +268,11 @@ int main(int argc, char* argv[]) {
         if (new_states < 5000000) {
             fprintf(stderr,
                 "\r  St:%zu +%zu | Stk:%zuM(%+lldK) r:%.2f | "
-                "ins:%.1fK | ETA:%s | %dthr %.0fs     ",
+                "pop:%.1fK ins:%.1fK dup:%.1fK | drain:%s ETA:%s | %dthr %.0fs     ",
                 s, new_states, total_stack / 1000000,
                 stack_delta / 1000, pp_ratio,
-                ins_delta / 1e3, eta_buf,
+                pop_rate / 1e3, ins_rate / 1e3, dup_rate / 1e3,
+                drain_buf, eta_buf,
                 active_threads, elapsed);
         } else {
             fprintf(stderr,
@@ -332,7 +347,7 @@ int main(int argc, char* argv[]) {
         total_states += thread_stats[t].states & 0x3FF; // un-flushed remainder
     size_t total_terminal = 0, total_moves = 0;
     size_t total_infinite = 0, total_inner = 0;
-    size_t peak_stack = 0, total_steals = 0;
+    size_t peak_stack = 0, total_steals = 0, total_pops = 0;
 
     for (int t = 0; t < num_threads; ++t) {
         total_terminal += thread_stats[t].terminal;
@@ -340,6 +355,7 @@ int main(int argc, char* argv[]) {
         total_infinite += thread_stats[t].infinite;
         total_inner    += thread_stats[t].inner_row_end;
         total_steals   += thread_stats[t].steals;
+        total_pops     += thread_stats[t].pops;
         if (thread_stats[t].stack_peak > peak_stack)
             peak_stack = thread_stats[t].stack_peak;
     }
@@ -392,6 +408,7 @@ int main(int argc, char* argv[]) {
     printf("\nResults\n-------\n");
     printf("Complete:          %s\n", complete ? "YES" : "NO");
     printf("Canonical states:  %zu\n", total_states);
+    printf("States popped:     %zu\n", total_pops);
     printf("Terminal states:   %zu\n", total_terminal);
     printf("Moves explored:    %zu\n", total_moves);
     printf("Infinite moves:    %zu\n", total_infinite);
@@ -408,3 +425,4 @@ int main(int argc, char* argv[]) {
     delete[] g.work;
     return complete ? 0 : 1;
 }
+
